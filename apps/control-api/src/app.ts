@@ -16,7 +16,7 @@ import {
   evaluateCompiledPlan,
 } from "./authoring.js";
 import { importAgentBundle } from "./agent-import.js";
-import { applyAgentToAuthoringSources, updateNodeCaseWrites } from "./authoring-agents.js";
+import { applyAgentToAuthoringSources, materializeRegisteredContracts, updateNodeCaseWrites } from "./authoring-agents.js";
 
 export function buildControlApi(options: { db?: Database } = {}) {
   const app = Fastify({ logger: true });
@@ -169,10 +169,26 @@ export function buildControlApi(options: { db?: Database } = {}) {
   });
   app.post<{ Params: { draftId: string } }>("/v1/authoring/drafts/:draftId/compile", async (request, reply) => {
     try {
-      const draft = await getAuthoringDraft(db, request.params.draftId);
+      let draft = await getAuthoringDraft(db, request.params.draftId);
       if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
       if (draft.status !== "DRAFT") return reply.code(409).send({ error: "authoring.compile_requires_draft" });
-      const registry = await listRegisteredCapabilities(db);
+      const [registry, registeredAgents, registeredSkills] = await Promise.all([
+        listRegisteredCapabilities(db), listAuthoringAgents(db), listAuthoringSkills(db),
+      ]);
+      const sources = materializeRegisteredContracts({
+        packageSource: draft.packageSource,
+        workflowSource: draft.workflowSource,
+        agents: registeredAgents.filter((item) => item.agent.status === "active").map((item) => item.agent),
+        skills: registeredSkills.filter((item) => item.skill.status === "active").map((item) => item.skill),
+      });
+      if (sources.materialized) {
+        const analysis = analyzeAuthoringSources(sources.packageSource, sources.workflowSource);
+        draft = await updateAuthoringSources(db, draft.draftId, {
+          expectedRevision: draft.revision, packageSource: sources.packageSource, workflowSource: sources.workflowSource,
+          parsedPackage: analysis.parsedPackage, parsedWorkflow: analysis.parsedWorkflow, ...analysis.metadata,
+          diagnostics: analysis.diagnostics, actor: actor(request.headers),
+        });
+      }
       const result = await compileAuthoringDraft({
         packageSource: draft.packageSource, workflowSource: draft.workflowSource,
         registryCapabilities: registry.filter((item) => item.capability.status === "active").map((item) => item.capability),

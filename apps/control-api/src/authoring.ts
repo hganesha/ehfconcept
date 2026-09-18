@@ -300,10 +300,15 @@ export async function compileAuthoringDraft(input: {
 }
 
 export function evaluateCompiledPlan(plan: HarnessPlan): EvaluationReport {
+  const agentIds = new Set((plan.agents ?? []).map((agent) => agent.id));
+  const skillIds = new Set((plan.skills ?? []).map((skill) => skill.id));
+  const agentNodes = plan.graph.nodes.filter((node) => node.kind === "agent" || node.kind === "evaluate");
+  const agentContractsResolved = agentNodes.every((node) => typeof node.config.agentRef === "string" && agentIds.has(node.config.agentRef));
+  const skillContractsResolved = agentNodes.every((node) => !Array.isArray(node.config.skillRefs) || node.config.skillRefs.every((skillId) => typeof skillId === "string" && skillIds.has(skillId)));
   const checks = [
     { id: "graph.connected", label: "Executable topology", passed: plan.graph.nodeOrder.length === plan.graph.nodes.length, detail: `${plan.graph.nodes.length} nodes ordered without a cycle.` },
     { id: "authority.bound", label: "Capability authority", passed: plan.permissionEnvelopes.length === plan.graph.nodes.filter((node) => typeof node.config.capabilityId === "string").length, detail: `${plan.permissionEnvelopes.length} node permission envelopes emitted.` },
-    { id: "agents.embedded", label: "Embedded agent and skill contracts", passed: (plan.agents?.length ?? 0) >= plan.graph.nodes.filter((node) => node.kind === "agent" || node.kind === "evaluate").length && (plan.skills?.length ?? 0) > 0, detail: `${plan.agents?.length ?? 0} agents and ${plan.skills?.length ?? 0} skills compiled from source.` },
+    { id: "agents.embedded", label: "Embedded agent and skill contracts", passed: agentContractsResolved && skillContractsResolved, detail: `${agentNodes.length} agent nodes resolve through ${plan.agents?.length ?? 0} embedded agent contracts and ${plan.skills?.length ?? 0} skill contracts.` },
     { id: "case-writes.schema", label: "Case-write contracts", passed: true, detail: `${plan.graph.nodes.reduce((sum, node) => sum + (Array.isArray(node.config.caseWrites) ? node.config.caseWrites.length : 0), 0)} canonical command schemas validated.` },
     { id: "budgets.bounded", label: "Execution budgets", passed: plan.budgets.maxDurationMs > 0 && plan.budgets.maxCapabilityCalls >= plan.capabilities.length, detail: `Duration ${plan.budgets.maxDurationMs}ms; ${plan.budgets.maxCapabilityCalls} capability calls.` },
     { id: "runtime.compatible", label: "LangGraph runtime profile", passed: plan.execution.engine.adapterVersion === "harness-langgraph-v1", detail: plan.execution.engine.adapterVersion },
