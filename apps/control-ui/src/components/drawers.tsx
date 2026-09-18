@@ -411,9 +411,15 @@ export function StartRunDrawer({
   const [submitting, setSubmitting] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
+  const initializedPlanRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!isOpen || !plan) return;
+    if (!isOpen || !plan) {
+      initializedPlanRef.current = null;
+      return;
+    }
+    if (initializedPlanRef.current === plan.planDigest) return;
+    initializedPlanRef.current = plan.planDigest;
     closeBtnRef.current?.focus();
 
     const defaults: Record<string, unknown> = {};
@@ -423,26 +429,24 @@ export function StartRunDrawer({
           ? prefillInput[key]
           : prop.default ?? "";
     }
-    const initializeTimer = window.setTimeout(() => {
-      setFormValues(defaults);
-      setJsonText(JSON.stringify(defaults, null, 2));
-      setIdempotencyKey(
-        `idem-${plan.domain.slice(0, 6)}-${Date.now().toString(36)}-${Math.random()
-          .toString(36)
-          .slice(2, 6)}`
-      );
-      setErrors([]);
-    }, 0);
+    setFormValues(defaults);
+    setJsonText(JSON.stringify(defaults, null, 2));
+    setIdempotencyKey(
+      `idem-${plan.domain.slice(0, 6)}-${Date.now().toString(36)}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`
+    );
+    setErrors([]);
+  }, [isOpen, plan, prefillInput]);
 
+  useEffect(() => {
+    if (!isOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.clearTimeout(initializeTimer);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [isOpen, plan, prefillInput, onClose]);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
 
   if (!isOpen || !plan) return null;
 
