@@ -11,6 +11,7 @@ import {
   FileCode,
   Sliders,
   ShieldCheck,
+  PlusCircle,
   ChevronDown,
   ChevronUp,
 } from "lucide-react";
@@ -409,6 +410,7 @@ export function StartRunDrawer({
   const [idempotencyKey, setIdempotencyKey] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [creatingDemoCase, setCreatingDemoCase] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
   const initializedPlanRef = useRef<string | null>(null);
@@ -508,6 +510,47 @@ export function StartRunDrawer({
       setErrors([err instanceof Error ? err.message : "Failed to submit run request"]);
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const createFreshDemoCase = async () => {
+    setErrors([]);
+    let current: Record<string, unknown> = { ...formValues };
+    if (mode === "json") {
+      try {
+        current = JSON.parse(jsonText) as Record<string, unknown>;
+      } catch (error) {
+        setErrors([`Client JSON syntax error: ${error instanceof Error ? error.message : "invalid JSON"}`]);
+        return;
+      }
+    }
+    setCreatingDemoCase(true);
+    try {
+      const response = await fetch("/v1/cases", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          planDigest: plan.planDigest,
+          tenantId: current.tenantId,
+          name: current.name,
+          country: current.country,
+          customerType: current.customerType,
+          riskTier: current.riskTier,
+          policySnapshotDigest: current.policySnapshotDigest,
+        }),
+      });
+      const result = await response.json() as { inputPatch?: Record<string, unknown>; message?: string; error?: string };
+      if (!response.ok || !result.inputPatch) {
+        setErrors([result.message ?? result.error ?? "Unable to create a fresh demo case."]);
+        return;
+      }
+      const next = { ...current, ...result.inputPatch };
+      setFormValues(next);
+      setJsonText(JSON.stringify(next, null, 2));
+    } catch (error) {
+      setErrors([error instanceof Error ? error.message : "Unable to create a fresh demo case."]);
+    } finally {
+      setCreatingDemoCase(false);
     }
   };
 
@@ -660,6 +703,28 @@ export function StartRunDrawer({
             onChange={(e) => setJsonText(e.target.value)}
             className="field mono min-h-[12rem] resize-y leading-relaxed"
           />
+        </div>
+      )}
+
+      {plan.domain === "kyc" && (
+        <div className="rounded-xl border border-line bg-surface-2 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-bold text-ink">Canonical case required</p>
+              <p className="mt-1 text-[11.5px] text-ink-2">
+                Create a fresh local KYC case and subject, then populate their generated IDs into this input.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={creatingDemoCase || submitting}
+              onClick={() => void createFreshDemoCase()}
+            >
+              <PlusCircle className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>{creatingDemoCase ? "Creating case…" : "Create fresh demo case"}</span>
+            </button>
+          </div>
         </div>
       )}
 

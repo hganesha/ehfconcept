@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   CompiledHarnessPlan,
   CaseActivityView,
@@ -892,6 +892,90 @@ export async function listCaseSummaries(filters?: { status?: string; query?: str
     item.caseType,
     item.status,
   ].some((value) => value.toLowerCase().includes(needle)));
+}
+
+export async function createDemoKycCase(input: {
+  planDigest: string;
+  tenantId?: string;
+  name?: string;
+  country?: string;
+  customerType?: string;
+  riskTier?: string;
+  policySnapshotDigest?: string;
+}): Promise<{ caseId: string; subjectId: string; inputPatch: JsonMap }> {
+  const tenantId = input.tenantId?.trim() || caseTenantId;
+  const name = input.name?.trim() || "Ada Lovelace";
+  const country = input.country?.trim().toUpperCase() || "US";
+  if (country !== "US") throw new Error("demo_case.us_jurisdiction_only");
+  const customerType = input.customerType === "sole_proprietor" ? "sole_proprietor" : "individual";
+  const riskTier = ["standard", "elevated", "high"].includes(input.riskTier ?? "") ? input.riskTier! : "standard";
+  const requestedPolicyDigest = input.policySnapshotDigest?.trim() ?? "";
+  const policySnapshotDigest = /^[a-f0-9]{64}$/i.test(requestedPolicyDigest)
+    ? requestedPolicyDigest
+    : "b".repeat(64);
+  const demoId = randomUUID();
+  const actor = { type: "SYSTEM", principalId: "control-surface-demo-intake", roles: [] };
+  const idempotencyKey = `ui-demo:${demoId}`;
+  const created = await apiJson<{ case: RawCaseSummary }>(caseBase, "/v1/cases", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": `${idempotencyKey}:case` },
+    body: JSON.stringify({
+      tenantId,
+      externalRef: `KYC-DEMO-${demoId.slice(0, 8)}`,
+      policySnapshotDigest,
+      harnessPlanDigest: input.planDigest,
+      actor,
+    }),
+  });
+  const subjectId = `subject_demo_${demoId.replaceAll("-", "").slice(0, 16)}`;
+  const permissionEnvelopeDigest = sha({ action: "AddSubject", planDigest: input.planDigest, source: "control-surface-demo" });
+  const subjectResult = await apiJson<{ createdIdentifiers?: { subjectId?: string } }>(
+    caseBase,
+    `/v1/cases/${encodeURIComponent(created.case.caseId)}/commands`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        commandId: `cmd_demo_${demoId.replaceAll("-", "")}`,
+        commandType: "AddSubject",
+        commandVersion: "kyc.command.add_subject.v1",
+        tenantId,
+        caseId: created.case.caseId,
+        actor,
+        authority: {
+          planDigest: input.planDigest,
+          permissionEnvelopeDigest,
+          policySnapshotDigest,
+        },
+        payload: {
+          subjectId,
+          subjectType: "individual",
+          displayName: name,
+          attributes: { country, customerType, riskTier },
+          identifiers: [],
+        },
+        preconditions: { caseSequence: created.case.caseSequence },
+        idempotencyKey: `${idempotencyKey}:subject`,
+      }),
+    },
+  );
+  const createdSubjectId = subjectResult.createdIdentifiers?.subjectId ?? subjectId;
+  return {
+    caseId: created.case.caseId,
+    subjectId: createdSubjectId,
+    inputPatch: {
+      tenantId,
+      caseId: created.case.caseId,
+      subjectId: createdSubjectId,
+      name,
+      aliases: [],
+      country,
+      customerType,
+      riskTier,
+      policySnapshotDigest,
+      linkedEvidenceRefs: [],
+    },
+  };
 }
 
 const CASE_CATEGORY_ORDER = [
