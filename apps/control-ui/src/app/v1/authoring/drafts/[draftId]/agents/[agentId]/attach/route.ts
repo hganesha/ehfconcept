@@ -1,0 +1,3 @@
+import { NextRequest, NextResponse } from "next/server";
+import { attachAuthoringAgentView } from "@/lib/runtime-service";
+export async function POST(request: NextRequest, context: { params: Promise<{ draftId: string; agentId: string }> }) { try { const { draftId, agentId } = await context.params; return NextResponse.json(await attachAuthoringAgentView(draftId, agentId, await request.json())); } catch (error) { const message = error instanceof Error ? error.message : "Unknown error"; return NextResponse.json({ error: "AGENT_ATTACHMENT_FAILED", message }, { status: message.includes("conflict") ? 409 : 400 }); } }

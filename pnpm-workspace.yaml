@@ -1,0 +1,22 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  protobufjs: true
+  sharp: true
+  unrs-resolver: true
+
+minimumReleaseAgeExclude:
+  - '@ai-sdk/gateway@4.0.85'
+  - '@ai-sdk/provider-utils@5.0.43'
+  - '@ai-sdk/provider@4.0.17'
+  - ai@7.0.105
+  - lucide-react@1.47.0
+
+onlyBuiltDependencies:
+  - esbuild
+  - protobufjs
+  - sharp
+  - unrs-resolver

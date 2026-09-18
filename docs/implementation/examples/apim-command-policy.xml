@@ -1,0 +1,43 @@
+<!-- Illustrative APIM API-level policy, not a complete production policy.
+     Populate named values and backend registration. Validate in chosen APIM SKU.
+     Backend MUST validate x-hf-execution-token against principal/work/tenant/lease,
+     enforce business authorization and schemas, and reject missing context.
+     Use a separate human-review API policy requiring its own roles/scopes. -->
+<policies>
+  <inbound>
+    <base />
+    <validate-azure-ad-token tenant-id="{{entra-tenant-id}}"
+                            header-name="Authorization"
+                            failed-validation-httpcode="401"
+                            output-token-variable-name="callerJwt">
+      <audiences>
+        <audience>{{harness-api-audience}}</audience>
+      </audiences>
+      <required-claims>
+        <claim name="roles" match="any">
+          <value>Harness.Command.Propose</value>
+        </claim>
+      </required-claims>
+    </validate-azure-ad-token>
+    <set-header name="x-tenant-id" exists-action="delete" />
+    <set-header name="x-principal-id" exists-action="delete" />
+    <set-header name="x-hf-verified-caller-oid" exists-action="override">
+      <value>@(((Jwt)context.Variables["callerJwt"]).Claims.GetValueOrDefault("oid", ""))</value>
+    </set-header>
+    <rate-limit-by-key calls="60" renewal-period="60"
+      counter-key='@(((Jwt)context.Variables["callerJwt"]).Claims.GetValueOrDefault("oid", "unknown"))' />
+    <set-backend-service backend-id="harness-command-service" />
+    <authentication-managed-identity resource="{{command-service-audience}}"
+                                     client-id="{{apim-tools-identity-client-id}}" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <set-header name="Server" exists-action="delete" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

@@ -1,0 +1,21 @@
+{
+  "name": "@ehf/runtime-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@ehf/contracts": "workspace:*",
+    "@ehf/persistence": "workspace:*",
+    "@ehf/runtime-langgraph": "workspace:*",
+    "@ehf/telemetry": "workspace:*",
+    "@langchain/langgraph-checkpoint-postgres": "1.0.5",
+    "fastify": "5.12.5"
+  }
+}

@@ -1,0 +1,193 @@
+services:
+  jaeger:
+    image: jaegertracing/jaeger:2.11.0
+    command:
+      - --set=receivers.otlp.protocols.grpc.endpoint=0.0.0.0:4317
+      - --set=receivers.otlp.protocols.http.endpoint=0.0.0.0:4318
+    ports:
+      - "16686:16686"
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ehf
+    volumes:
+      - ehf-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ehf"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: pnpm db:migrate
+    environment: &runtime-env
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
+      MODEL_PROFILES_PATH: /app/config/model-profiles.json
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_TRACES_SAMPLER_ARG: "1"
+      DEPLOYMENT_ENVIRONMENT: local
+      CLOUD_REGION: local
+      TRACE_VIEWER_BASE_URL: http://localhost:16686
+      CASE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
+      CASE_CORE_SCHEMA: ${CASE_CORE_SCHEMA:-case_core}
+      CASE_LEDGER_SCHEMA: ${CASE_LEDGER_SCHEMA:-case_ledger}
+      EVIDENCE_SCHEMA: ${EVIDENCE_SCHEMA:-evidence}
+      CASE_ARTIFACT_BACKEND: ${CASE_ARTIFACT_BACKEND:-postgres}
+      CASE_EVIDENCE_REQUIRE_SCAN: ${CASE_EVIDENCE_REQUIRE_SCAN:-false}
+      CASE_EVIDENCE_MAX_BYTES: ${CASE_EVIDENCE_MAX_BYTES:-1048576}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  control-api:
+    build: .
+    command: pnpm --filter @ehf/control-api start
+    environment:
+      <<: *runtime-env
+      CONTROL_API_PORT: "4100"
+    ports:
+      - "4100:4100"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  capability-gateway:
+    build: .
+    command: pnpm --filter @ehf/capability-gateway start
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      <<: *runtime-env
+      GATEWAY_PORT: "4101"
+      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
+    ports:
+      - "4101:4101"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4101/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  case-api:
+    build: .
+    command: pnpm --filter @ehf/case-api start
+    environment:
+      <<: *runtime-env
+      CASE_API_PORT: "4102"
+    ports:
+      - "4102:4102"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4102/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  runtime-host-local:
+    build: .
+    # Invoke the checked-in runtime directly so the read-only container never
+    # asks pnpm to repair or relink the workspace at startup.
+    command: ./node_modules/.bin/tsx apps/runtime-host/src/server.ts
+    environment:
+      RUNTIME_CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
+      RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
+      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
+      CAPABILITY_GATEWAY_URL: http://capability-gateway:4101
+      CASE_API_URL: http://case-api:4102
+      RUNTIME_HOST_PORT: "8088"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_TRACES_SAMPLER_ARG: "1"
+      DEPLOYMENT_ENVIRONMENT: local
+      CLOUD_REGION: local
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      capability-gateway:
+        condition: service_healthy
+      case-api:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8088/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  runtime-dispatcher:
+    build: .
+    command: pnpm --filter @ehf/runtime-worker start
+    environment:
+      <<: *runtime-env
+      RUNTIME_PROVIDER: ${RUNTIME_PROVIDER:-local_http}
+      RUNTIME_LOCAL_ENDPOINT: http://runtime-host-local:8088/invocations
+      RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
+      FOUNDRY_AGENT_INVOCATION_ENDPOINT: ${FOUNDRY_AGENT_INVOCATION_ENDPOINT:-}
+      FOUNDRY_AGENT_NAME: ${FOUNDRY_AGENT_NAME:-}
+      FOUNDRY_AGENT_VERSION: ${FOUNDRY_AGENT_VERSION:-}
+      FOUNDRY_TOKEN_SCOPE: ${FOUNDRY_TOKEN_SCOPE:-https://ai.azure.com/.default}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      WORKER_LEASE_SECONDS: "60"
+    depends_on:
+      runtime-host-local:
+        condition: service_healthy
+      control-api:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  control-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    environment:
+      CONTROL_API_INTERNAL_URL: http://control-api:4100
+      CAPABILITY_GATEWAY_INTERNAL_URL: http://capability-gateway:4101
+      CASE_API_INTERNAL_URL: http://case-api:4102
+      CASE_UI_TENANT_ID: ${CASE_UI_TENANT_ID:-tenant_demo}
+      JAEGER_API_INTERNAL_URL: http://jaeger:16686
+      TRACE_VIEWER_PUBLIC_URL: http://localhost:16686
+      CONTROL_UI_VERSION: 0.1.0
+      RUNTIME_PROVIDER: ${RUNTIME_PROVIDER:-local_http}
+      FOUNDRY_AGENT_INVOCATION_ENDPOINT: ${FOUNDRY_AGENT_INVOCATION_ENDPOINT:-}
+      FOUNDRY_AGENT_NAME: ${FOUNDRY_AGENT_NAME:-}
+      FOUNDRY_AGENT_VERSION: ${FOUNDRY_AGENT_VERSION:-}
+    ports:
+      - "4200:4200"
+    depends_on:
+      control-api:
+        condition: service_healthy
+      capability-gateway:
+        condition: service_healthy
+      case-api:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4200/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  ehf-postgres:

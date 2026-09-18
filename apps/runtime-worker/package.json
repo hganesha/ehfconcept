@@ -1,0 +1,20 @@
+{
+  "name": "@ehf/runtime-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "dev": "tsx watch src/worker.ts",
+    "start": "tsx src/worker.ts"
+  },
+  "dependencies": {
+    "@ehf/contracts": "workspace:*",
+    "@ehf/persistence": "workspace:*",
+    "@ehf/runtime-provider": "workspace:*",
+    "@ehf/telemetry": "workspace:*",
+    "@opentelemetry/api": "1.9.1"
+  }
+}

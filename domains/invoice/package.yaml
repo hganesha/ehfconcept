@@ -1,0 +1,46 @@
+apiVersion: harness.factory/domain-package-v1
+kind: DomainPackage
+metadata:
+  name: invoice-match
+  version: 0.1.0
+  domain: accounts-payable
+  objective: Verify a vendor and purchase order, then recommend invoice disposition.
+workflow: workflow.yaml
+budgets:
+  maxDurationMs: 120000
+  maxCostUsd: 0.25
+  maxModelCalls: 2
+  maxCapabilityCalls: 5
+modelProfiles: [model.fast.v1]
+capabilities:
+  - id: vendor.lookup
+    kind: tool
+    effect: read
+    adapterBindingId: simulator:vendor.lookup
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    timeoutMs: 5000
+    maxAttempts: 2
+    idempotent: true
+  - id: purchase_order.lookup
+    kind: tool
+    effect: read
+    adapterBindingId: simulator:purchase_order.lookup
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    timeoutMs: 5000
+    maxAttempts: 2
+    idempotent: true
+  - id: model.invoice.recommend
+    kind: model
+    effect: paid
+    adapterBindingId: openrouter:model.fast.v1
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    timeoutMs: 60000
+    maxAttempts: 1
+    idempotent: false
+bindings:
+  vendor-check: vendor.lookup
+  po-check: purchase_order.lookup
+  recommendation: model.invoice.recommend

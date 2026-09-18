@@ -1,0 +1,22 @@
+{
+  "name": "@ehf/capability-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@ehf/adapters": "workspace:*",
+    "@ehf/contracts": "workspace:*",
+    "@ehf/execution-auth": "workspace:*",
+    "@ehf/persistence": "workspace:*",
+    "@ehf/telemetry": "workspace:*",
+    "@opentelemetry/api": "1.9.1",
+    "fastify": "5.12.5"
+  }
+}

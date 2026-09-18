@@ -1,0 +1,11 @@
+{
+  "README.md": "8d5447a3aaf260e7bf37ec626c9bb07879bebaafd244043b3e6616ecfdcb9dcc",
+  "config/foundation.azure.yaml": "bf140bb102a455ff7ff57749bd5a52b439be21e2e8db92f67b02a507396e7332",
+  "config/kyc.domain.yaml": "cfcc9bf9ab2762e36676880d526af67fb41aeaa477bf97917e3ef833577c0d15",
+  "delivery-backlog.csv": "1972b652f566c2b2523ecc2a5206f5c4e55f6b6fc3a057bbd9ca4a4e716f3b17",
+  "examples/apim-command-policy.xml": "6dc62773a1d64f611bf0bd3874f406f99c052901940ee73cf3180f25d54c46df",
+  "examples/command-transaction.txt": "347430c62777cdb463b00036c0098155a3e23830001ff2d426add144bff1245a",
+  "implementation-plan.md": "0cbb5ab70c02cc3091aa90686143e76ac76af4c6e7bce13065ea2e8842383422",
+  "validation-report.md": "a286d8b7115c783dc3d27d0cbba56a52f081b0b2383e082dd4987f0a43ac8d46",
+  "pdf/harness-factory-foundation-kyc-plan.pdf": "d9c7502f5e5b93daf3c51700bc5b9a8073c01c7b39fd7203d4ce2669a6aa4b45"
+}

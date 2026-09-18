@@ -1,0 +1,3 @@
+import { NextRequest, NextResponse } from "next/server";
+import { importAuthoringAgentFromGithub } from "@/lib/runtime-service";
+export async function POST(request: NextRequest) { try { const body = await request.json() as { url?: unknown }; if (typeof body.url !== "string") return NextResponse.json({ error: "GITHUB_URL_REQUIRED" }, { status: 400 }); return NextResponse.json(await importAuthoringAgentFromGithub(body.url), { status: 201 }); } catch (error) { return NextResponse.json({ error: "GITHUB_IMPORT_FAILED", message: error instanceof Error ? error.message : "Unknown error" }, { status: 400 }); } }

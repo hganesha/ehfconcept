@@ -1,0 +1,46 @@
+REFERENCE ALGORITHM - not executable SQL
+
+Before opening the transaction:
+  Authenticate principal and signed execution/user context.
+  Authorize tenant/case/capability; validate command schema and payload size.
+  Resolve exact evidence versions and hashes; no model/tool calls in transaction.
+  Compute canonical request digest and semantic operation key.
+
+BEGIN
+  Reserve (tenant_id, semantic_operation_key) in command_receipts.
+    If another committed receipt exists:
+      same digest -> return the persisted result without reapplying;
+      different digest -> reject IDEMPOTENCY_KEY_REUSE.
+    Concurrent inserts serialize on the unique constraint.
+
+  SELECT Case head FOR UPDATE using tenant_id and case_id.
+  Read current WorkItem lease/fencing epoch and entity revisions.
+  Validate actor permissions, plan revocation and current policy authority.
+  Recheck accepted evidence metadata and decision durability receipts.
+  Evaluate command invariants using current transaction data.
+
+  For FinalizeDisposition:
+    Recompute required work and current dependency digest.
+    Verify required QA/reviews apply to that digest.
+    Verify nonwaivable prohibitions, authorized actor, and separation of duties.
+
+  Apply typed changes through domain command handler.
+  Allocate monotonic per-case sequence for each material event.
+  Append CaseEvent(s) with command/actor/policy/evidence references.
+  Create/update WorkItems and outbox rows in the same transaction.
+  Write durable command outcome and generated identifiers.
+COMMIT
+
+Outbox dispatcher:
+  Lease unpublished rows in short transactions.
+  Publish using deterministic event + destination / dispatch-generation IDs.
+  Mark sent after broker acknowledgement.
+  Crash between publish and marking -> duplicate permitted; consumer dedupes.
+
+Important:
+  A DB receipt is not atomic with a vendor side effect. Use separate tool
+  operation receipts with provider idempotency/lookup and UNKNOWN reconciliation.
+  Rejected immutable commands can retain audit receipts; a reworked command
+  uses a new operation intent/version, never silently changes an old key.
+  Recorded execution/model output may be reused for replay, but accepted history
+  is never rewritten by a replay or reevaluation.

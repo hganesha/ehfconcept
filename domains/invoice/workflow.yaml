@@ -1,0 +1,34 @@
+apiVersion: ladder.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: invoice-match
+  title: Invoice Match
+  description: Minimal vendor and purchase-order verification harness.
+  version: 0.1.0
+spec:
+  objective: Recommend pay or manual review using vendor and PO evidence.
+  inputs:
+    type: object
+    required: [vendorName, purchaseOrderId, amount]
+    properties:
+      vendorName: { type: string }
+      purchaseOrderId: { type: string }
+      amount: { type: number }
+  outputs: { type: object }
+  policies: { maxConcurrency: 2, onFailure: stop, requireApprovalFor: [] }
+  nodes:
+    - { id: intake, kind: input, name: Invoice intake }
+    - { id: vendor-check, kind: tool, name: Vendor lookup }
+    - { id: po-check, kind: tool, name: Purchase order lookup }
+    - id: recommendation
+      kind: evaluate
+      inlineRole: true
+      name: Invoice recommendation
+      role: Accounts payable reviewer
+      prompt: Recommend pay or manual_review from the verification evidence and explain any mismatch.
+    - { id: result, kind: output, name: Invoice disposition }
+  edges:
+    - { id: e1, from: intake, to: vendor-check, kind: data }
+    - { id: e2, from: vendor-check, to: po-check, kind: data }
+    - { id: e3, from: po-check, to: recommendation, kind: data }
+    - { id: e4, from: recommendation, to: result, kind: data }

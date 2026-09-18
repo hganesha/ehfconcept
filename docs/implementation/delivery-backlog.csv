@@ -1,0 +1,26 @@
+id,work_package_and_owner,effort_person_weeks,dependencies_and_acceptance
+F01,"Architecture decisions, threat/data-flow model / architect + security",3,D01-D10 owners assigned; regional/service compatibility matrix accepted
+F02,"Landing zone, IaC, private CI and quotas / cloud platform",5,F01; repeatable dev deployment; policy and public-access negative tests
+F03,Network/DNS and identity skeleton / platform + security,5,F02; private paths and executor bypass denial proven
+F04,Contract suite and SDK / platform engineers,4,F01; version compatibility tests and reference fixtures
+F05,Case/command/ledger and transaction boundary / backend + DBA,7,F03/F04; atomic state/event/outbox and stale/duplicate command tests
+F06,Evidence ingestion/durability/retention / data engineer,5,F03/F04; no accepted dangling artifacts; hold/restore proof
+F07,"Kernel, scheduler, leases and budgets / backend",7,F05; crash/lease/fencing/retry/budget concurrency tests
+F08,"Compiler, registry, signing and revocation / platform + security",7,"F04; deterministic build, unsafe package rejection, revocation enforcement"
+F09,APIM model/tool gateway and adapter SDK / integration,5,F03/F04; identity chain and no direct endpoint bypass
+F10,Generic executor + Foundry compatibility proof / AI engineering,5,F04/F09; hosted path passes or Container Apps fallback selected
+F11,"Context, policy and assurance services / AI + backend",6,"F05/F06/F08; trust partitions, RLS/filter tests, reproducible policy results"
+F12,"Recorder, monitoring and security integration / SRE",4,F05-F11; complete audit export plus alerts without raw PII
+F13,Evaluation/replay infrastructure / QA + AI,5,"F04/F08/F10; layered evals, pinned fixtures and signed attestation"
+F14,"Recovery, operations and platform acceptance / SRE + security",5,F05-F13; restore/reconcile/failover evidence and on-call handover
+K01,"KYC rule catalog, lifecycle, risk and data schemas / policy + domain engineering",5,"F01/F04, D03/D07; signed rule-to-test mapping; UNSET values tracked"
+K02,Intake and identity/ownership normalization / backend,4,F05/K01; valid/invalid individual and entity cases with provenance
+K03,Screening adapter and skills / integration + AI,5,"F06/F09/K01, vendor access; no-match/outage/alias/candidate fixtures"
+K04,Internal and external search / integration + AI,5,"F09/F11; ACL, egress, source capture and injection tests"
+K05,Investigation and work-planning specs / AI + domain,4,F07/F10/K03/K04; bounded hypothesis/evidence/rework loop
+K06,Policy interpretation and decision packet / domain + AI,4,F11/K01/K05; clause-linked rationale; deterministic rule authority preserved
+K07,Independent QA and finalization gates / QA + backend,5,"F11/K06; stale packet, unknown result and prohibited outcome blocked"
+K08,"Analyst UI, task assignment and approvals / frontend + backend",5,"F05/F07/K02; accessible review flow, evidence navigation, four-eyes tests"
+K09,Periodic review and downstream handoff / backend + integration,3,K07/K08; durable review schedule and idempotent integration
+K10,"Golden corpus, UAT and pilot / QA + operations",6,"K02-K09/F13; adjudicated expected outcomes, measured defects and acceptance"
+K11,"Runbooks, training and production readiness / operations + SRE",3,"K10/F14; staffing, recovery, change controls and rollout approval"

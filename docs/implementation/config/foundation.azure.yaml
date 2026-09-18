@@ -1,0 +1,308 @@
+# Planning configuration schema; NOT an ARM, Bicep, or azd deployment file.
+# Proposed values require SKU, region, quota, policy, and network validation.
+apiVersion: planning.harness/v1
+kind: AzureFoundationBaseline
+metadata:
+  version: 1.0.0
+  date: '2026-09-17'
+  status: proposed_not_deployed
+  geography: USA
+  geography_source: user_confirmed
+scope:
+  entraTenantId: REPLACE_WITH_TENANT_ID
+  subscriptionIds:
+    connectivity: REPLACE_WITH_SUBSCRIPTION_ID
+    management: REPLACE_WITH_SUBSCRIPTION_ID
+    controlProd: REPLACE_WITH_SUBSCRIPTION_ID
+    executionProd: REPLACE_WITH_SUBSCRIPTION_ID
+    nonprod: REPLACE_WITH_SUBSCRIPTION_ID
+  primaryRegion: eastus2
+  recoveryRegion: centralus
+  regionSelectionStatus: proposed_validate_all_services
+  environment: prod
+  stamp: us01
+  tenantIsolation: shared_regulated
+  dedicatedTenantOverride:
+    separateProject: true
+    separateDatabase: true
+    separateStorage: true
+    separateKeys: true
+    separateComputeAndIdentities: true
+naming:
+  pattern: '{type}-hf-{component}-{env}-{region}-{ordinal}'
+  requiredTags: [owner, costCenter, environment, domain, dataClassification, residency, criticality, serviceId, managedBy, repository]
+network:
+  hubCidr: 10.40.0.0/16
+  executionCidr: 10.41.0.0/16
+  addressStatus: enterprise_ipam_approval_required
+  publicAnalystIngress: false
+  privateCorporateConnectivity: existing_vpn_or_expressroute
+  firewall:
+    sku: Standard
+    subnet: 10.40.0.0/26
+    defaultApplicationEgress: deny
+    vendorAllowlist: [] # Populate with contracted endpoints; empty denies vendor access.
+    platformDependencies: REQUIRED_FROM_SELECTED_SERVICE_DOCUMENTATION
+  dnsResolver:
+    inboundSubnet: 10.40.1.0/28
+    outboundSubnet: 10.40.1.16/28
+  subnets:
+    platform: {cidr: 10.41.0.0/23, delegation: Microsoft.App/environments}
+    executor: {cidr: 10.41.2.0/23, delegation: Microsoft.App/environments}
+    connectors: {cidr: 10.41.4.0/23, delegation: Microsoft.App/environments}
+    apim: {cidr: 10.41.6.0/24, delegation: null}
+    privateEndpoints: {cidr: 10.41.7.0/24, delegation: null}
+    foundryAgents: {cidr: 10.41.8.0/23, delegation: RESOLVE_FOR_SELECTED_FOUNDRY_MODE}
+    postgres: {cidr: 10.41.10.0/26, delegation: Microsoft.DBforPostgreSQL/flexibleServers}
+    build: {cidr: 10.41.11.0/26, delegation: null}
+    logicApps: {cidr: 10.41.12.0/26, delegation: RESOLVE_IF_ENABLED}
+  privateDnsZones:
+    - privatelink.blob.core.windows.net
+    - privatelink.vaultcore.azure.net
+    - privatelink.servicebus.windows.net
+    - privatelink.search.windows.net
+    - privatelink.azurecr.io
+    - privatelink.azconfig.io
+  additionalDns:
+    postgres: hf-prod.postgres.database.azure.com
+    containerApps: USE_EACH_ENVIRONMENT_DEFAULT_DOMAIN_AND_INTERNAL_VIP
+    foundryAndModels: USE_PRIVATE_ENDPOINT_RETURNED_ZONE_CONFIGURATION
+    apimCustomDomain: REPLACE_WITH_INTERNAL_DOMAIN
+  endpointControls:
+    denyPublicDataAccess: true
+    executorDirectDataAccess: deny
+    executorDirectModelAccess: deny
+    executorDirectVendorAccess: deny
+    endpointNsgAndRoutePolicies: explicitly_configure_and_negative_test
+identity:
+  humanAuth: Entra_ID
+  workloadAuth: managed_identity
+  ciAuth: oidc_federation
+  staticAzureKeys: prohibited
+  databaseEntraOnly: true
+  principalPerServiceAndAgentRole: true
+  executionToken:
+    format: signed_jwt
+    maxLifetimeSeconds: 120
+    renewOnlyWithValidLease: true
+    requiredClaims: [aud, exp, principal_id, tenant_id, case_id, work_item_id, plan_hash, fencing_epoch, capabilities]
+  runtimeAgentsResourceDataRoles: []
+  humanRoles: [KYC.Analyst, KYC.SeniorReviewer, KYC.PolicyAuthor, KYC.PolicyApprover, Harness.ReleaseApprover, Harness.Operator, KYC.Auditor]
+compute:
+  environments: [platform, executor, connectors]
+  environmentType: workload_profiles
+  internalLoadBalancer: true
+  zoneRedundant: true
+  runtimeHostPreference: foundry_hosted_after_compatibility_gate
+  runtimeHostFallback: isolated_container_apps
+  services:
+    case: {cpu: 1, memoryGiB: 2, minReplicas: 3, maxReplicas: 10}
+    kernel: {cpu: 1, memoryGiB: 2, minReplicas: 3, maxReplicas: 10}
+    context: {cpu: 1, memoryGiB: 2, minReplicas: 3, maxReplicas: 10}
+    outbox: {cpu: 0.5, memoryGiB: 1, minReplicas: 2, maxReplicas: 4}
+    connector: {cpu: 0.5, memoryGiB: 1, minReplicas: 2, maxReplicas: 10}
+    executorFallback: {cpu: 1, memoryGiB: 2, minReplicas: 0, maxReplicas: 50}
+    analystUi: {cpu: 0.5, memoryGiB: 1, minReplicas: 3, maxReplicas: 6}
+  images: digest_pinned
+  probes: [startup, readiness, liveness]
+  scaleGuardrails: [model_quota, vendor_quota, db_connections, case_budget]
+apim:
+  sku: Premium
+  generation: classic
+  units: 2
+  zones: ['1', '2'] # Resolve supported zone IDs in the actual region.
+  virtualNetworkType: Internal
+  inboundPrivateEndpoint: false # Classic internal-injection baseline; do not mix designs.
+  clientAuthentication: entra_token
+  backendAuthentication: user_assigned_managed_identity
+  requestBodyLogging: false
+  responseBodyLogging: false
+  cacheKycModelResponses: false
+  businessRulesInGateway: false
+  policies:
+    tokenValidation: required_tenant_audience_role
+    commandRateLimitPerPrincipalPerMinute: 60
+    arbitraryBackendSelection: deny
+    callerIdentityHeaderOverride: strip
+    backendExecutionEnvelopeValidation: required
+postgres:
+  connectivityMode: private_access_delegated_subnet
+  privateEndpoint: false
+  publicAccess: false
+  version: '16'
+  authentication: {activeDirectoryAuth: Enabled, passwordAuth: Disabled}
+  caseServer:
+    tier: GeneralPurpose
+    skuCandidate: Standard_D4ds_v5
+    vcores: 4
+    storageGiB: 256
+    storageAutoGrow: true
+    highAvailability: ZoneRedundant
+    backupRetentionDays: 35
+    dr: cross_region_read_replica
+  controlServer:
+    tier: GeneralPurpose
+    skuCandidate: Standard_D2ds_v5
+    vcores: 2
+    storageGiB: 128
+    highAvailability: ZoneRedundant
+    backupRetentionDays: 35
+  client:
+    sslmode: verify-full
+    pgbouncerPort: 6432
+    directPort: 5432
+    poolMode: transaction
+    maxAggregateServerConnectionsInitial: 160
+    statementTimeoutMs: 15000
+    lockTimeoutMs: 2000
+    idleInTransactionTimeoutMs: 30000
+  approvedExtensions: []
+  pgvector: deferred
+  schemas: [case_core, case_ledger, workflow, assurance, execution, integration, harness_control, harness_registry]
+  tenantControls: [composite_foreign_keys, force_rls, no_bypassrls, nonowner_runtime_role, transaction_local_tenant]
+storage:
+  kind: StorageV2
+  sku: Standard_ZRS
+  hnsEnabled: false
+  publicNetworkAccess: Disabled
+  allowBlobPublicAccess: false
+  allowSharedKeyAccess: false
+  minimumTlsVersion: TLS1_2
+  accounts: [evidence, executions, releases, quarantine, ledger]
+  acceptedEvidence:
+    versioningEnabled: true
+    versionLevelImmutability: true
+    retentionScheduleId: UNSET_BLOCKS_REAL_DATA
+    initialRetentionDays: null
+    legalHoldScope: blob_version
+    acceptedReference: exact_blob_version_and_sha256
+  staging:
+    allowedDataUntilRetentionApproved: synthetic_only
+    orphanCleanupDays: 7 # Applies only when no legal hold / retention obligation exists.
+  recovery:
+    mechanism: application_verified_copy_to_independent_zrs_account
+    region: centralus
+    retentionAndHoldOnDestination: required
+    finalizedEvidenceRequiresCopyReceipt: true
+    approvedCrossRegionTransfer: UNSET_BLOCKS_PRODUCTION
+serviceBus:
+  sku: Premium
+  messagingUnits: 1
+  publicNetworkAccess: Disabled
+  disableLocalAuth: true
+  privateEndpoint: true
+  queues: [work.ready.screening, work.ready.search, work.ready.investigation, work.ready.decision, work.ready.qa, work.ready.platform, work.human-notifications]
+  defaults:
+    requiresDuplicateDetection: true
+    duplicateDetectionHistoryTimeWindow: PT10M
+    lockDuration: PT1M
+    defaultMessageTimeToLive: P1D
+    maxDeliveryCount: 5
+    deadLetteringOnMessageExpiration: true
+    requiresSession: false
+  messageId: tenant_id:work_item_id:dispatch_generation
+  canonicalState: postgresql_work_items
+  drMode: rebuild_dispatch_from_recovered_database
+  metadataGeoDrDoesNotProtectMessageBodies: true
+workflow:
+  leaseSeconds: 90
+  heartbeatSeconds: 20
+  fencingRequired: true
+  maxExecutorConcurrency: 50
+  outboxPublishTargetSeconds: 60
+  sweeperIntervalSeconds: 30
+  semanticIdempotency: tenant_case_work_operation_target
+  unknownSideEffectOutcome: reconciliation_required
+  budgets: {caseUsd: 20, caseToolCalls: 200, activeMachineMinutes: 30}
+search:
+  sku: standard
+  partitions: 1
+  replicas: 3
+  publicNetworkAccess: disabled
+  disableLocalAuth: true
+  privateEndpoint: true
+  authorization: rbac_and_server_generated_security_filters
+  requiredFilterFields: [tenant_id, case_id, allowed_principals, classification, purpose]
+  reauthorizeCanonicalArtifact: true
+foundry:
+  projectPartition: environment_residency_isolation_class
+  resourceNames: REPLACE_WITH_APPROVED_ACCOUNT_AND_PROJECT
+  publicNetworkAccess: Disabled
+  executionNetworking: selected_byo_vnet_mode
+  modelGateway: apim_only
+  toolsGateway: apim_only
+  permittedProcessingGeography: US
+  permittedDeploymentType: Standard_regional
+  dataZoneDeployment: only_if_us_data_zone_approved
+  globalDeployment: prohibited
+  profiles:
+    reasoning.standard: {deployment: UNSET, modelVersion: UNSET, attestation: UNSET}
+    reasoning.high: {deployment: UNSET, modelVersion: UNSET, attestation: UNSET}
+    reasoning.qa: {deployment: UNSET, modelVersion: UNSET, attestation: UNSET}
+  contextTokensInitial: 24000
+  outputTokensInitial: 4000
+  hostedCompatibilityTests: [apim_model_route, private_tool_route, direct_route_denial, identity_binding, cancellation, telemetry, contract_compatibility]
+  missingApprovedProfile: fail_closed
+keyVault:
+  secretsSku: standard
+  signingSku: premium_if_hsm_required
+  enableRbacAuthorization: true
+  enablePurgeProtection: true
+  softDeleteRetentionInDays: 90
+  publicNetworkAccess: Disabled
+  privateEndpoint: true
+  agentSecretReadAccess: false
+acr:
+  sku: Premium
+  adminUserEnabled: false
+  publicNetworkAccess: Disabled
+  privateEndpoint: true
+  deployByDigest: true
+  retainReleasedImages: true
+appConfiguration:
+  sku: standard
+  publicNetworkAccess: Disabled
+  privateEndpoint: true
+  authentication: entra_rbac
+  pointerUpdate: etag_compare_and_swap
+  revocationMaxStalenessSeconds: 60
+observability:
+  regionalWorkspace: true
+  applicationInsights: workspace_based
+  operationalRetentionDays: 30
+  rawPiiInTelemetry: prohibited
+  modelBodiesInOperationalLogs: prohibited
+  executionAndLedgerSampling: never
+  alerts:
+    outboxAgeSeconds: 60
+    queueAgeSeconds: 120
+    providerErrorPercent: 5
+    providerErrorWindowMinutes: 5
+    databaseCpuPercent: 70
+    databaseStoragePercent: 80
+  budgetAlertPercentages: [50, 75, 90, 100]
+optional:
+  eventGrid: integration_events_only
+  logicApps: standard_connector_only
+  purview: link_enterprise_asset_ids_to_evidence
+  defenderSentinel: enterprise_soc_integration
+  agent365: license_and_feature_gate
+release:
+  infrastructureAsCode: bicep
+  privateCiRunner: true
+  productionExecutes: signed_immutable_plan_only
+  humanConfirmedPilot: true
+  initialTrafficStepsPercent: [5, 25, 100]
+  productionBlockers: [approved_jurisdiction_rules, retention_schedule, exact_regions_and_quotas, model_attestations, vendor_contracts, network_proof, dr_drill]
+environmentOverrides:
+  dev:
+    caseDatabaseHa: Disabled
+    caseBackupDays: 7
+    storageSku: Standard_LRS
+    apimSku: Developer
+    criticalMinReplicas: 0
+    data: synthetic_only
+    operationalRetentionDays: 14
+  preprod:
+    productionNetworkIdentityAndSkuParity: true
+    reducedCapacityRequiresSeparateLoadTest: true

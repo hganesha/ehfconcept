@@ -1,0 +1,198 @@
+# Planning domain schema; requires implementation of the compiler/contracts.
+apiVersion: planning.harness/v1
+kind: KycDomainBaseline
+metadata:
+  name: enterprise-kyc-us
+  version: 1.0.0
+  status: proposed_not_compiled
+scope:
+  jurisdiction: US
+  jurisdictionSource: user_confirmed
+  institutionType: UNSET
+  businessUnit: UNSET
+  productTypes: []
+  customerTypes: [individual, legal_entity]
+  initialIsolationClass: shared_regulated
+  complexOwnership: human_review_until_certified
+release:
+  planDigest: UNSET
+  policyBundleDigest: UNSET
+  evaluationAttestation: UNSET
+  migrationVersion: UNSET
+  executeRawYamlInProduction: false
+  pilot: true
+  allowAutoApprove: false
+  allowAutoDecline: false
+  permitAutomaticRegulatorySubmission: false
+  permitAutomaticCustomerCommunication: false
+policyInputs:
+  requiredIdentityFields: UNSET
+  approvedIdentityEvidence: UNSET
+  beneficialOwnershipThresholdAndAggregation: UNSET
+  controlPersonRules: UNSET
+  jurisdictionAndProductCoverage: UNSET
+  sanctionsDatasetsAndFreshness: UNSET
+  pepPolicy: UNSET
+  adverseMediaPolicy: UNSET
+  sourceOfFundsAndWealthRules: UNSET
+  riskScoringAndBands: UNSET
+  periodicReviewIntervals: UNSET
+  waiverAuthorityAndNonwaivableRules: UNSET
+  accountOpeningReliefAdopted: UNSET
+  cipNoticeAndVerificationPolicy: UNSET
+  ofacOwnershipAnalysisPolicy: UNSET
+  accountLifecycleRetentionTriggers: UNSET
+  retentionSchedule: UNSET
+  unresolvedPolicyInput: block_production_compile
+contracts:
+  case: kyc.case.v1
+  subject: kyc.subject.v1
+  relationship: kyc.relationship.v1
+  recommendation: kyc.recommendation.v1
+  disposition: kyc.disposition.v1
+  evidence: harness.evidence.v1
+  claim: harness.claim.v1
+  fact: harness.fact.v1
+  workItem: harness.work-item.v1
+  agentResult: harness.agent-result.v1
+caseStates: [INTAKE, VALIDATING, SCREENING, INVESTIGATING, READY_FOR_DECISION, QA_REVIEW, HUMAN_REVIEW, NEEDS_INFORMATION, SUSPENDED, APPROVED, DECLINED, CLOSED]
+qaOutcomes: [PASS, FAIL, UNKNOWN, ERROR]
+budgets:
+  caseUsd: 20
+  toolCalls: 200
+  activeMachineMinutes: 30
+  humanWaitExcludedFromActiveMachineBudget: true
+agents:
+  orchestrator:
+    capabilities: [work.plan]
+    proposedCommands: [ProposeWorkItem]
+    modelProfile: reasoning.standard
+    prohibits: [direct_workflow_state_write, FinalizeDisposition]
+  policy:
+    capabilities: [policy.interpret]
+    modelProfile: reasoning.high
+    proposedCommands: [ProposeClaim, RecordAssumption, RequestHumanReview]
+    prohibits: [policy_bundle_change, policy_override, FinalizeDisposition]
+  screening:
+    capabilities: [screening.sanctions, screening.pep]
+    tools: [sanctions.screen, pep.screen]
+    modelProfile: reasoning.standard
+    contextSelectors: [subject.identity, subject.aliases, evidence.identity, contradictions.identity]
+    proposedCommands: [RegisterEvidence, ProposeClaim, RecordScreeningFinding, RaiseContradiction]
+    budget: {usd: 1.50, toolCalls: 20, runtimeSeconds: 120}
+  internal-search:
+    capabilities: [customer.internal.search, document.internal.retrieve]
+    modelProfile: reasoning.standard
+    contextSelectors: [subject.minimal_identity, required_evidence]
+    proposedCommands: [RegisterEvidence, ProposeClaim]
+    egress: internal_only
+  external-search:
+    capabilities: [research.external.search]
+    modelProfile: reasoning.standard
+    contextSelectors: [subject.approved_public_identity]
+    proposedCommands: [RegisterEvidence, ProposeClaim, RecordAssumption]
+    egress: approved_public_research_provider_only
+    prohibits: [internal_document_export, sensitive_identifier_export]
+  investigation:
+    capabilities: [investigation.identity, investigation.ownership, investigation.edd]
+    modelProfile: reasoning.high
+    proposedCommands: [ProposeWorkItem, ProposeClaim, RecordAssumption, RaiseContradiction, ResolveContradiction, RequestHumanReview]
+    budget: {usd: 5, toolCalls: 20, runtimeSeconds: 300}
+    stopWhen: [sufficient_evidence, no_new_information, budget_exhausted, deadline_reached, human_judgment_required]
+  decision:
+    capabilities: [decision.recommend]
+    modelProfile: reasoning.high
+    contextContract: kyc.decision-packet.v1
+    proposedCommands: [SubmitDecisionRecommendation, RequestHumanReview]
+    prohibits: [FinalizeDisposition, AcceptClaimAsFact]
+  qa:
+    capabilities: [assurance.verify]
+    modelProfile: reasoning.qa
+    contextContract: kyc.verification-packet.v1
+    proposedCommands: [RecordQAResult, ProposeWorkItem, RequestHumanReview]
+    distinctPrincipalFromDecision: true
+    prohibits: [FinalizeDisposition, self_approval]
+tools:
+  sanctions.screen:
+    adapter: UNSET_APPROVED_PROVIDER
+    effect: READ_ONLY
+    timeoutMs: 8000
+    maxRetries: 2
+    totalCallBudgetSeconds: 30
+    requireRawEvidence: true
+    requireDatasetVersionAndEffectiveTime: true
+  pep.screen:
+    adapter: UNSET_APPROVED_PROVIDER
+    effect: READ_ONLY
+    timeoutMs: 8000
+    maxRetries: 2
+    totalCallBudgetSeconds: 30
+    requireRawEvidence: true
+  customer.internal.search:
+    adapter: UNSET_CUSTOMER_MASTER
+    effect: READ_ONLY
+    serverSideAcl: required
+  document.internal.retrieve:
+    adapter: UNSET_DOCUMENT_SYSTEM
+    effect: READ_ONLY
+    preserveSourceAcl: true
+  research.external.search:
+    adapter: UNSET_APPROVED_RESEARCH_PROVIDER
+    effect: READ_ONLY
+    allContentTrust: UNTRUSTED_EXTERNAL
+    arbitraryUrl: deny
+    ssrfChecks: required
+workflow:
+  strategy: dynamic_work_items
+  mandatoryCapabilityGraph:
+    identityValidation: {precedes: [screening, ownershipReview]}
+    screening: {conditionalNext: [identityInvestigation, decisionReadiness]}
+    ownershipReview: {appliesTo: legal_entity, conditionalNext: [ownershipInvestigation, decisionReadiness]}
+    investigation: {conditionalNext: [rework, humanReview, decisionReadiness]}
+    decisionReadiness: {requires: all_policy_required_work_complete, precedes: [decisionRecommendation]}
+    decisionRecommendation: {precedes: [deterministicQa, semanticQa]}
+    qa: {conditionalNext: [rework, humanReview]}
+    humanReview: {precedes: [finalGate]}
+    finalGate: {conditionalNext: [effectiveDisposition, rework, suspension]}
+  noMatchIsSearchFailure: false
+  failedMandatoryToolCanSatisfyRequirement: false
+  qaUnknownCanPass: false
+  identityRevisionChange: invalidate_dependent_screening_findings_and_decisions
+  maxReworkCyclesInitial: 2
+  exceededRework: human_review
+finalization:
+  writer: case_command_service_only
+  gateReevaluatedInCommit: true
+  requires:
+    - authorized_actor
+    - separation_of_duties
+    - current_dependency_digest
+    - unrevoked_plan
+    - applicable_current_policy_authority
+    - required_work_complete
+    - required_evidence_accepted_fresh_and_durable
+    - decision_evidence_recovery_copy_receipts
+    - no_prohibited_material_uncertainty
+    - applicable_qa_requirements_satisfied
+    - permitted_outcome
+    - required_human_approval
+  rejects: [stale_review_snapshot, missing_artifact, unresolved_possible_sanctions_match_for_approval, unverified_high_materiality_assumption_for_approval]
+humanReview:
+  analystRole: KYC.Analyst
+  seniorReviewerRole: KYC.SeniorReviewer
+  ordinaryAssignmentBusinessHours: 4
+  urgentRouteMinutes: 15
+  fourEyesForHighRisk: true
+  nonwaivableRuleOverride: prohibited
+periodicReview:
+  interval: UNSET_POLICY_REQUIRED
+  materialChangeTriggers: [identity_changed, ownership_changed, new_provider_match, relevant_policy_changed, evidence_expired]
+  createNewEpisode: true
+  preservePriorDisposition: true
+evaluation:
+  initialAdjudicatedCases: 300
+  strata: [individual, entity, aliases, near_matches, sanctions_concern, pep, adverse_media, missing_identity, complex_ownership, contradictory_evidence, stale_sources, provider_outage, prompt_injection]
+  zeroUnsafeApprovalsInReleaseCorpus: true
+  statisticalSufficiency: policy_owner_and_model_risk_review_required
+  numericalRecallPrecisionThresholds: UNSET
+  livePilotInitialReviewedCases: 100
