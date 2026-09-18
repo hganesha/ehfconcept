@@ -172,9 +172,11 @@ function sha(value: unknown): string {
 }
 
 function primitive(kind: string, capability?: RawCapability): NodePrimitive {
-  if (capability?.kind === "model" || kind === "agent") return "model";
-  if (kind === "condition" || kind === "evaluate") return "evaluate";
-  if (kind === "aggregator") return "join";
+  if (kind === "agent") return "agent";
+  if (kind === "condition") return "condition";
+  if (kind === "evaluate") return "evaluate";
+  if (kind === "aggregator") return "aggregator";
+  if (capability?.kind === "model") return "model";
   if (kind === "input" || kind === "output" || kind === "tool" || kind === "transform" || kind === "join") return kind;
   return "transform";
 }
@@ -792,10 +794,13 @@ export async function getSystemStatus(): Promise<SystemView> {
     supportedPrimitives: [
       ["input", true, "Canonical input admission."],
       ["transform", true, "Deterministic state transformation."],
+      ["agent", false, "Registered agent contract resolved through a model capability tier."],
       ["model", false, "Tier-routed OpenRouter invocation through the capability gateway."],
       ["tool", true, "Envelope-authorized capability invocation."],
+      ["condition", true, "Deterministic control-edge routing."],
       ["evaluate", true, "Policy and model-assisted evaluation."],
-      ["join", true, "Graph branch synchronization."],
+      ["join", true, "All-source or typed all-settled branch synchronization."],
+      ["aggregator", true, "Deterministic collect, merge, concat, or vote reduction."],
       ["output", true, "Terminal output sealing."],
     ].map(([nodePrimitive, deterministicReplay, description]) => ({
       primitive: nodePrimitive as NodePrimitive,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { businessCommandSchema, canonicalJson, createKycCaseRequestSchema, stableDigest } from "./index.js";
+import { businessCommandSchema, canonicalJson, createKycCaseRequestSchema, graphNodeSchema, stableDigest } from "./index.js";
 
 describe("canonical contracts", () => {
   it("sorts object keys while preserving array order", () => {
@@ -33,5 +33,12 @@ describe("canonical contracts", () => {
       preconditions: { caseSequence: 1 },
       idempotencyKey: "tenant_demo:case_1:add-subject:primary",
     }).commandType).toBe("AddSubject");
+  });
+
+  it("admits only implemented transform, aggregator, and join modes", () => {
+    expect(graphNodeSchema.parse({ id: "dedupe", kind: "transform", name: "Dedupe", config: { operation: "deduplicate" } }).kind).toBe("transform");
+    expect(graphNodeSchema.parse({ id: "vote", kind: "aggregator", name: "Vote", config: { operation: "vote" } }).kind).toBe("aggregator");
+    expect(graphNodeSchema.parse({ id: "settled", kind: "join", name: "Settled", config: { mode: "allSettled" } }).kind).toBe("join");
+    expect(graphNodeSchema.safeParse({ id: "first", kind: "join", name: "First", config: { mode: "first" } }).success).toBe(false);
   });
 });

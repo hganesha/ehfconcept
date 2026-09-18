@@ -31,6 +31,10 @@ export const permissionEnvelopeSchema = z.object({
   digest: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 
+const supportedTransformOperations = new Set(["identity", "select", "project", "merge", "deduplicate", "sort", "slice"]);
+const supportedAggregatorOperations = new Set(["collect", "merge", "concat", "vote"]);
+const supportedJoinModes = new Set(["all", "allSettled"]);
+
 export const graphNodeSchema = z.object({
   id: z.string().min(1),
   kind: z.enum([
@@ -50,7 +54,19 @@ export const graphNodeSchema = z.object({
   inputSchema: z.record(z.string(), z.unknown()).nullable().optional(),
   outputSchema: z.record(z.string(), z.unknown()).nullable().optional(),
   config: z.record(z.string(), z.unknown()).default({}),
-}).strict();
+}).strict().superRefine((node, context) => {
+  const operation = String(node.config.operation ?? (node.kind === "aggregator" ? "collect" : "identity"));
+  if (node.kind === "transform" && !supportedTransformOperations.has(operation)) {
+    context.addIssue({ code: "custom", path: ["config", "operation"], message: `Unsupported transform operation: ${operation}.` });
+  }
+  if (node.kind === "aggregator" && !supportedAggregatorOperations.has(operation)) {
+    context.addIssue({ code: "custom", path: ["config", "operation"], message: `Unsupported aggregator operation: ${operation}.` });
+  }
+  if (node.kind === "join") {
+    const mode = String(node.config.mode ?? node.config.operation ?? "all");
+    if (!supportedJoinModes.has(mode)) context.addIssue({ code: "custom", path: ["config", "mode"], message: `Unsupported join mode: ${mode}.` });
+  }
+});
 
 export const graphEdgeSchema = z.object({
   id: z.string().min(1),

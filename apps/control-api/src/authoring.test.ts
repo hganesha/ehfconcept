@@ -69,6 +69,72 @@ spec:
     );
   });
 
+  it("accepts the complete deterministic transform, aggregator, and join profile", () => {
+    const packageSource = `
+apiVersion: harness.factory/domain-package-v1
+kind: DomainPackage
+metadata: { name: primitives, version: 0.1.0, domain: test, objective: Test }
+workflow: workflow.yaml
+budgets: { maxDurationMs: 1000, maxCostUsd: 0, maxModelCalls: 0, maxCapabilityCalls: 0 }
+capabilities: []
+bindings: {}
+`;
+    const workflowSource = `
+apiVersion: ladder.dev/v1alpha1
+kind: Workflow
+metadata: { name: primitives }
+spec:
+  inputs: { type: object }
+  outputs: { type: object }
+  nodes:
+    - { id: input, kind: input }
+    - { id: dedupe, kind: transform, config: { operation: deduplicate } }
+    - { id: aggregate, kind: aggregator, config: { operation: vote } }
+    - { id: settled, kind: join, config: { mode: allSettled } }
+    - { id: output, kind: output }
+  edges:
+    - { id: a, from: input, to: dedupe, kind: data }
+    - { id: b, from: dedupe, to: aggregate, kind: data }
+    - { id: c, from: aggregate, to: settled, kind: data }
+    - { id: d, from: settled, to: output, kind: data }
+`;
+    expect(analyzeAuthoringSources(packageSource, workflowSource).diagnostics.filter((item) => item.severity === "error")).toEqual([]);
+  });
+
+  it("rejects unsupported deterministic primitive modes during authoring", () => {
+    const packageSource = `
+apiVersion: harness.factory/domain-package-v1
+kind: DomainPackage
+metadata: { name: primitives, version: 0.1.0, domain: test, objective: Test }
+workflow: workflow.yaml
+budgets: { maxDurationMs: 1000, maxCostUsd: 0, maxModelCalls: 0, maxCapabilityCalls: 0 }
+capabilities: []
+bindings: {}
+`;
+    const workflowSource = `
+apiVersion: ladder.dev/v1alpha1
+kind: Workflow
+metadata: { name: primitives }
+spec:
+  inputs: { type: object }
+  outputs: { type: object }
+  nodes:
+    - { id: input, kind: input }
+    - { id: bad-transform, kind: transform, config: { operation: execute-javascript } }
+    - { id: bad-aggregate, kind: aggregator, config: { operation: average } }
+    - { id: bad-join, kind: join, config: { mode: first } }
+    - { id: output, kind: output }
+  edges:
+    - { id: a, from: input, to: bad-transform, kind: data }
+    - { id: b, from: bad-transform, to: bad-aggregate, kind: data }
+    - { id: c, from: bad-aggregate, to: bad-join, kind: data }
+    - { id: d, from: bad-join, to: output, kind: data }
+`;
+    expect(analyzeAuthoringSources(packageSource, workflowSource).diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "author.transform_operation_unsupported", "author.aggregator_operation_unsupported", "author.join_mode_unsupported",
+    ]));
+  });
+
   it("rejects mixed runtime targets within one invocation", () => {
     const packageSource = `
 apiVersion: harness.factory/domain-package-v1

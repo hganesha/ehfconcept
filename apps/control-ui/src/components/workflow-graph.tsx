@@ -74,25 +74,43 @@ export function WorkflowThumbnail({
           );
         })}
         {nodes.map((n) => {
+          const isAgent = n.primitive === "agent";
           const isModel = n.primitive === "model";
           const isTool = n.primitive === "tool";
           const isEval = n.primitive === "evaluate";
+          const isCondition = n.primitive === "condition";
+          const isAggregator = n.primitive === "aggregator";
           const isOutput = n.primitive === "output";
 
           return (
             <g key={n.id} transform={`translate(${n.x}, ${n.y})`}>
-              {isEval ? (
+              {isCondition ? (
                 <polygon
                   points="0,-28 62,0 0,28 -62,0"
+                  fill="#EAF3F8"
+                  stroke="#3E88B5"
+                  strokeWidth="2.5"
+                />
+              ) : isEval ? (
+                <polygon
+                  points="-48,-25 48,-25 62,0 48,25 -48,25 -62,0"
                   fill="#FEF8EC"
                   stroke="#A67C25"
                   strokeWidth="2.5"
                 />
-              ) : isModel ? (
+              ) : isAgent ? (
                 <polygon
                   points="-52,-24 52,-24 66,0 52,24 -52,24 -66,0"
                   fill="#EDF5EF"
                   stroke="#287A5B"
+                  strokeWidth="2.5"
+                />
+              ) : isModel || isAggregator ? (
+                <ellipse
+                  rx="60"
+                  ry="24"
+                  fill={isAggregator ? "#F4EFFB" : "#EEF1FB"}
+                  stroke={isAggregator ? "#7653A6" : "#5568A8"}
                   strokeWidth="2.5"
                 />
               ) : (
@@ -141,13 +159,22 @@ export function GraphLegend({ showExecutionStates = false }: { showExecutionStat
           <span className="font-mono-code font-bold text-[#26312B]">▷/◉</span> Input/Output (pill)
         </span>
         <span className="inline-flex items-center gap-1">
-          <span className="font-mono-code font-bold text-[#287A5B]">⬡</span> Agent/Model (hexagon)
+          <span className="font-mono-code font-bold text-[#287A5B]">⬡</span> Agent (hexagon)
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="font-mono-code font-bold text-[#5568A8]">◆</span> Model capability (ellipse)
         </span>
         <span className="inline-flex items-center gap-1">
           <span className="font-mono-code font-bold text-[#3E88B5]">▣</span> Tool Capability (box)
         </span>
         <span className="inline-flex items-center gap-1">
-          <span className="font-mono-code font-bold text-[#A67C25]">⚖</span> Evaluate Gate (diamond)
+          <span className="font-mono-code font-bold text-[#3E88B5]">◇</span> Condition (diamond)
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="font-mono-code font-bold text-[#A67C25]">⚖</span> Evaluate gate (hexagon)
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="font-mono-code font-bold text-[#7653A6]">Σ</span> Aggregator (ellipse)
         </span>
       </div>
       {showExecutionStates && (
@@ -356,15 +383,30 @@ export function WorkflowGraph({
             const state = nodeStates ? nodeStates[node.id] : undefined;
             const vis = getStateVisuals(state);
 
-            const fill = state ? vis.fill : isSelected ? "#EDF5EF" : "#FFFFFF";
+            const primitiveFill = node.primitive === "agent" ? "#EDF5EF"
+              : node.primitive === "model" ? "#EEF1FB"
+              : node.primitive === "condition" ? "#EAF3F8"
+              : node.primitive === "evaluate" ? "#FEF8EC"
+              : node.primitive === "aggregator" ? "#F4EFFB"
+              : "#FFFFFF";
+            const primitiveStroke = node.primitive === "agent" ? "#287A5B"
+              : node.primitive === "model" ? "#5568A8"
+              : node.primitive === "condition" ? "#3E88B5"
+              : node.primitive === "evaluate" ? "#A67C25"
+              : node.primitive === "aggregator" ? "#7653A6"
+              : "#8A968E";
+            const fill = state ? vis.fill : primitiveFill;
             const stroke = isSelected
               ? "#287A5B"
               : state
               ? vis.stroke
-              : "#8A968E";
+              : primitiveStroke;
 
-            const isHex = node.primitive === "model";
-            const isDiamond = node.primitive === "evaluate";
+            const isAgent = node.primitive === "agent";
+            const isModel = node.primitive === "model";
+            const isCondition = node.primitive === "condition";
+            const isEvaluate = node.primitive === "evaluate";
+            const isAggregator = node.primitive === "aggregator";
             const isPill =
               node.primitive === "input" || node.primitive === "output";
 
@@ -402,7 +444,7 @@ export function WorkflowGraph({
                   />
                 )}
 
-                {isDiamond ? (
+                {isCondition ? (
                   <polygon
                     points="0,-36 80,0 0,36 -80,0"
                     fill={fill}
@@ -410,9 +452,26 @@ export function WorkflowGraph({
                     strokeWidth={isSelected ? "2.8" : "2"}
                     strokeDasharray={vis.strokeDasharray}
                   />
-                ) : isHex ? (
+                ) : isEvaluate ? (
+                  <polygon
+                    points="-60,-32 60,-32 78,0 60,32 -60,32 -78,0"
+                    fill={fill}
+                    stroke={stroke}
+                    strokeWidth={isSelected ? "2.8" : "2"}
+                    strokeDasharray={vis.strokeDasharray}
+                  />
+                ) : isAgent ? (
                   <polygon
                     points="-66,-32 66,-32 78,0 66,32 -66,32 -78,0"
+                    fill={fill}
+                    stroke={stroke}
+                    strokeWidth={isSelected ? "2.8" : "2"}
+                    strokeDasharray={vis.strokeDasharray}
+                  />
+                ) : isModel || isAggregator ? (
+                  <ellipse
+                    rx="76"
+                    ry="32"
                     fill={fill}
                     stroke={stroke}
                     strokeWidth={isSelected ? "2.8" : "2"}

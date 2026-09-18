@@ -76,8 +76,11 @@ export default function HarnessDetailPage({
     input: "Input",
     transform: "Orchestration",
     join: "Orchestration",
+    aggregator: "Orchestration",
+    agent: "Intelligence",
     model: "Intelligence",
     tool: "Capabilities",
+    condition: "Policy gates",
     evaluate: "Policy gates",
     output: "Output",
   })[primitive] ?? "Orchestration";

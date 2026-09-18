@@ -92,7 +92,71 @@ export function transformValue(config: Record<string, unknown>, input: unknown):
     return Object.fromEntries(fields.map((field) => [field, getPath(input, field)]));
   }
   if (operation === "merge") return Object.assign({}, ...(Array.isArray(input) ? input : [input]));
+  if (operation === "deduplicate") {
+    if (!Array.isArray(input)) throw new Error("runtime.transform_deduplicate_array_required");
+    const path = typeof config.path === "string" ? config.path : undefined;
+    const seen = new Set<string>();
+    return input.filter((item) => {
+      const key = stableDigest((path ? getPath(item, path) : item) ?? null);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+  if (operation === "sort") {
+    if (!Array.isArray(input)) throw new Error("runtime.transform_sort_array_required");
+    const path = typeof config.path === "string" ? config.path : undefined;
+    const direction = config.direction === "desc" ? -1 : 1;
+    const comparable = (value: unknown): string | number => typeof value === "number" ? value : JSON.stringify(value ?? null);
+    return input.toSorted((left, right) => {
+      const a = comparable(path ? getPath(left, path) : left);
+      const b = comparable(path ? getPath(right, path) : right);
+      if (typeof a === "number" && typeof b === "number") return (a - b) * direction;
+      return (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0) * direction;
+    });
+  }
+  if (operation === "slice") {
+    if (!Array.isArray(input) && typeof input !== "string") throw new Error("runtime.transform_slice_sequence_required");
+    const start = Number.isInteger(config.start) ? Number(config.start) : 0;
+    const end = Number.isInteger(config.end) ? Number(config.end) : undefined;
+    return input.slice(start, end);
+  }
   throw new Error(`runtime.transform_unsupported:${operation}`);
+}
+
+function collectedValues(input: unknown): unknown[] {
+  if (Array.isArray(input)) return [...input];
+  if (input && typeof input === "object") return Object.values(input as Record<string, unknown>);
+  return [input];
+}
+
+export function aggregateValue(config: Record<string, unknown>, input: unknown): unknown {
+  const operation = String(config.operation ?? "collect");
+  const values = collectedValues(input);
+  if (operation === "collect") return values;
+  if (operation === "merge") {
+    if (!values.every((value) => value && typeof value === "object" && !Array.isArray(value))) {
+      throw new Error("runtime.aggregator_merge_objects_required");
+    }
+    return Object.assign({}, ...values as Record<string, unknown>[]);
+  }
+  if (operation === "concat") {
+    if (!values.every(Array.isArray)) throw new Error("runtime.aggregator_concat_arrays_required");
+    return (values as unknown[][]).flat();
+  }
+  if (operation === "vote") {
+    if (!values.length) return null;
+    const path = typeof config.path === "string" ? config.path : undefined;
+    const counts = new Map<string, { value: unknown; count: number; first: number }>();
+    values.forEach((item, index) => {
+      const value = path ? getPath(item, path) : item;
+      const key = stableDigest(value ?? null);
+      const current = counts.get(key);
+      counts.set(key, current ? { ...current, count: current.count + 1 } : { value, count: 1, first: index });
+    });
+    return [...counts.values()].sort((a, b) => b.count - a.count || a.first - b.first)[0]?.value ?? null;
+  }
+  throw new Error(`runtime.aggregator_unsupported:${operation}`);
 }
 
 export async function invokeCapability(

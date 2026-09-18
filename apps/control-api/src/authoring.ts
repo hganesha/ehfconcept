@@ -39,6 +39,9 @@ type WorkflowSource = {
 };
 
 const nodeKinds = new Set(["input", "output", "agent", "tool", "transform", "condition", "evaluate", "join", "aggregator"]);
+const transformOperations = new Set(["identity", "select", "project", "merge", "deduplicate", "sort", "slice"]);
+const aggregatorOperations = new Set(["collect", "merge", "concat", "vote"]);
+const joinModes = new Set(["all", "allSettled"]);
 
 function diagnostic(code: string, path: string, message: string, severity: AuthoringDiagnostic["severity"] = "error"): AuthoringDiagnostic {
   return { code, path, message, severity };
@@ -89,6 +92,20 @@ function validateCaseWrites(node: WorkflowNode, diagnostics: AuthoringDiagnostic
   });
 }
 
+function validatePrimitiveConfig(node: WorkflowNode, index: number, diagnostics: AuthoringDiagnostic[]) {
+  const operation = String(node.config?.operation ?? (node.kind === "aggregator" ? "collect" : "identity"));
+  if (node.kind === "transform" && !transformOperations.has(operation)) {
+    diagnostics.push(diagnostic("author.transform_operation_unsupported", `workflow.spec.nodes.${index}.config.operation`, `Unsupported transform operation: ${operation}.`));
+  }
+  if (node.kind === "aggregator" && !aggregatorOperations.has(operation)) {
+    diagnostics.push(diagnostic("author.aggregator_operation_unsupported", `workflow.spec.nodes.${index}.config.operation`, `Unsupported aggregator operation: ${operation}.`));
+  }
+  if (node.kind === "join") {
+    const mode = String(node.config?.mode ?? node.config?.operation ?? "all");
+    if (!joinModes.has(mode)) diagnostics.push(diagnostic("author.join_mode_unsupported", `workflow.spec.nodes.${index}.config.mode`, `Unsupported join mode: ${mode}.`));
+  }
+}
+
 export function analyzeAuthoringSources(packageSource: string, workflowSource: string): {
   parsedPackage: JsonMap;
   parsedWorkflow: JsonMap;
@@ -124,6 +141,7 @@ export function analyzeAuthoringSources(packageSource: string, workflowSource: s
     if (!node.id || ids.has(node.id)) diagnostics.push(diagnostic("author.node_id_invalid", `workflow.spec.nodes.${index}.id`, "Node IDs must be non-empty and unique."));
     ids.add(node.id);
     if (!nodeKinds.has(node.kind)) diagnostics.push(diagnostic("author.node_kind_unsupported", `workflow.spec.nodes.${index}.kind`, `Unsupported primitive: ${node.kind}.`));
+    validatePrimitiveConfig(node, index, diagnostics);
     validateCaseWrites(node, diagnostics);
   }
   for (const [index, edge] of edges.entries()) {

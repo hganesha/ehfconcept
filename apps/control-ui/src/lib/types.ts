@@ -21,10 +21,13 @@ export type NodeExecutionState =
 export type NodePrimitive =
   | "input"
   | "transform"
+  | "agent"
   | "model"
   | "tool"
+  | "condition"
   | "evaluate"
   | "join"
+  | "aggregator"
   | "output";
 
 export type CostView = {

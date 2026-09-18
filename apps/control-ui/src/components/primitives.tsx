@@ -313,10 +313,13 @@ export function PrimitiveBadge({ primitive }: { primitive: NodePrimitive }) {
     {
       input: { label: "Input", symbol: "▷", cls: "chip" },
       transform: { label: "Transform", symbol: "◇", cls: "chip" },
-      model: { label: "Agent · Model", symbol: "⬡", cls: "chip chip-ok" },
+      agent: { label: "Agent", symbol: "⬡", cls: "chip chip-ok" },
+      model: { label: "Model capability", symbol: "◆", cls: "chip chip-ok" },
       tool: { label: "Tool capability", symbol: "▣", cls: "chip chip-active" },
+      condition: { label: "Condition", symbol: "◇", cls: "chip chip-active" },
       evaluate: { label: "Evaluate gate", symbol: "⚖", cls: "chip chip-warn" },
-      join: { label: "Join · Aggregate", symbol: "⊕", cls: "chip" },
+      join: { label: "Join", symbol: "⊕", cls: "chip" },
+      aggregator: { label: "Aggregator", symbol: "Σ", cls: "chip chip-warn" },
       output: { label: "Terminal output", symbol: "◉", cls: "chip chip-ok" },
     };
   const info = map[primitive] || map.transform;
