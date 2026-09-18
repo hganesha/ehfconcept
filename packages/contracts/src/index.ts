@@ -62,6 +62,34 @@ export const graphEdgeSchema = z.object({
   targetPath: z.string().optional(),
 }).strict();
 
+export const businessCommandTypeSchema = z.enum([
+  "AddSubject",
+  "LinkEvidence",
+  "ProposeClaim",
+  "AcceptClaimAsFact",
+  "RecordScreeningFinding",
+  "RecordAssumption",
+  "RaiseContradiction",
+  "ResolveContradiction",
+  "ProposeWorkItem",
+  "CompleteWorkItem",
+  "LinkExecution",
+  "SubmitDecisionRecommendation",
+  "RecordGateResult",
+  "RecordQAResult",
+  "RecordReview",
+  "RequestHumanReview",
+  "TransitionCaseStatus",
+  "FinalizeDisposition",
+]);
+
+export const caseWriteContractSchema = z.object({
+  commandType: businessCommandTypeSchema,
+  when: z.string().min(1).optional(),
+  payload: z.record(z.string(), z.unknown()),
+  payloadSchema: z.record(z.string(), z.unknown()),
+}).strict();
+
 export const compiledSkillSchema = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9._-]*$/),
   name: z.string().min(1),
@@ -80,7 +108,8 @@ export const compiledAgentSchema = z.object({
   modelProfileId: z.string().min(1),
   runtimeTarget: z.enum(["local_http", "azure_foundry"]),
   skillIds: z.array(z.string().min(1)).default([]),
-  primaryCapabilityId: z.string().min(1),
+  caseWrites: z.array(caseWriteContractSchema).default([]),
+  primaryCapabilityId: z.string().min(1).optional(),
   inputSchema: z.record(z.string(), z.unknown()),
   outputSchema: z.record(z.string(), z.unknown()),
   version: z.string().min(1),
@@ -269,27 +298,6 @@ export const createKycCaseRequestSchema = z.object({
   actor: caseActorSchema,
 }).strict();
 
-export const businessCommandTypeSchema = z.enum([
-  "AddSubject",
-  "LinkEvidence",
-  "ProposeClaim",
-  "AcceptClaimAsFact",
-  "RecordScreeningFinding",
-  "RecordAssumption",
-  "RaiseContradiction",
-  "ResolveContradiction",
-  "ProposeWorkItem",
-  "CompleteWorkItem",
-  "LinkExecution",
-  "SubmitDecisionRecommendation",
-  "RecordGateResult",
-  "RecordQAResult",
-  "RecordReview",
-  "RequestHumanReview",
-  "TransitionCaseStatus",
-  "FinalizeDisposition",
-]);
-
 export const businessCommandSchema = z.object({
   commandId: z.string().min(1),
   commandType: businessCommandTypeSchema,
@@ -427,6 +435,7 @@ export const agentRegistrationSchema = z.object({
   modelProfileId: z.string().min(1).default("model.standard.v1"),
   runtimeTarget: runtimeProviderKindSchema.default("local_http"),
   skillIds: z.array(z.string().min(1)).default([]),
+  caseWrites: z.array(caseWriteContractSchema).default([]),
   primaryCapabilityId: z.string().min(1).optional(),
   inputSchema: z.record(z.string(), z.unknown()).default({ type: "object" }),
   outputSchema: z.record(z.string(), z.unknown()).default({ type: "object" }),

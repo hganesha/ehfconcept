@@ -70,10 +70,12 @@ export function buildAgentBundleFromFiles(repo: RepoRef, revision: string, files
   const name = String(manifest.name ?? repo.repo.replace(/[-_]+/g, " "));
   const role = String(manifest.role ?? manifest.persona ?? manifest.description ?? `${name} agent`);
   const primaryCapabilityId = manifest.primaryCapabilityId ?? manifest.capabilityId ?? manifest.capability_id;
+  const caseWritesValue = manifest.caseWrites ?? manifest.case_writes ?? (object(manifest.config) ? manifest.config.caseWrites : undefined);
   const agent = agentRegistrationSchema.parse({
     id: String(manifest.id ?? `agent.${slug(repo.owner)}.${slug(repo.repo)}.v1`), name,
     description: String(manifest.description ?? `Imported from ${repo.owner}/${repo.repo}`), role, prompt, modelProfileId, runtimeTarget,
     skillIds: skills.map((skill) => skill.id), ...(typeof primaryCapabilityId === "string" ? { primaryCapabilityId } : {}),
+    caseWrites: Array.isArray(caseWritesValue) ? caseWritesValue : [],
     inputSchema: object(manifest.inputSchema ?? manifest.input_schema) ? manifest.inputSchema ?? manifest.input_schema : { type: "object" },
     outputSchema: object(manifest.outputSchema ?? manifest.output_schema) ? manifest.outputSchema ?? manifest.output_schema : { type: "object" },
     source: { type: "github", url: repositoryUrl, ...(manifestFile ? { path: manifestFile.path } : {}), revision },

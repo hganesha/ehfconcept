@@ -45,9 +45,15 @@ export default function AuthorDraftPage({ params }: { params: Promise<{ draftId:
   const [capabilityForm, setCapabilityForm] = useState({ id: "", kind: "tool", effect: "read", adapterBindingId: "simulator:", description: "", owner: "platform-team" });
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [newAgentNodeId, setNewAgentNodeId] = useState("");
+  const [caseWritesEdit, setCaseWritesEdit] = useState<{ key: string; source: string } | null>(null);
   const draft = resource.data;
   const graph = useMemo(() => draft ? draftGraph(draft) : { nodes: [], edges: [], categories: [] }, [draft]);
   const selectedNode = graph.nodes.find((node) => node.id === (selectedNodeId ?? graph.nodes[0]?.id)) ?? null;
+  const selectedNodeConfig = selectedNode && object(selectedNode.data.config) ? selectedNode.data.config : {};
+  const caseWritesEditKey = `${draft?.revision ?? 0}:${selectedNode?.id ?? ""}`;
+  const caseWritesSource = caseWritesEdit?.key === caseWritesEditKey
+    ? caseWritesEdit.source
+    : JSON.stringify(Array.isArray(selectedNodeConfig.caseWrites) ? selectedNodeConfig.caseWrites : [], null, 2);
 
   const save = async () => {
     if (!draft) return; setBusy(true); setMessage(null);
@@ -70,6 +76,16 @@ export default function AuthorDraftPage({ params }: { params: Promise<{ draftId:
       setSelectedNodeId(body.attachedNodeId); setNewAgentNodeId(""); setMessage({ tone: "ok", text: `Agent attached to ${body.attachedNodeId}; workflow.yaml is now the source of truth.` }); await resource.refresh();
     } catch (cause) { setMessage({ tone: "error", text: cause instanceof Error ? cause.message : "Agent attachment failed" }); } finally { setBusy(false); }
   };
+  const saveCaseWrites = async () => {
+    if (!draft || !selectedNode) return; setBusy(true); setMessage(null);
+    try {
+      const caseWrites = JSON.parse(caseWritesSource) as unknown;
+      if (!Array.isArray(caseWrites)) throw new Error("Case writes must be a JSON array.");
+      const response = await fetch(`/v1/authoring/drafts/${encodeURIComponent(draft.draftId)}/nodes/${encodeURIComponent(selectedNode.id)}/case-writes`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedRevision: draft.revision, caseWrites }) });
+      const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error);
+      setMessage({ tone: "ok", text: `Saved ${caseWrites.length} case-write contract${caseWrites.length === 1 ? "" : "s"} on ${selectedNode.id}.` }); await resource.refresh();
+    } catch (cause) { setMessage({ tone: "error", text: cause instanceof Error ? cause.message : "Case-write update failed" }); } finally { setBusy(false); }
+  };
 
   return <AppShell title={draft?.name ?? "Domain authoring"} breadcrumb={[{ label: "Author Plane", href: "/author" }, { label: draft?.status ?? "Draft" }]} readiness={resource.hasRefreshError ? "Degraded" : "Ready"} runtimeMode="OpenRouter" fixture={false} lastRefreshedAt={resource.lastRefreshedAt} isRefreshing={resource.isRefreshing} hasRefreshError={resource.hasRefreshError} onManualRefresh={resource.refresh}>
     {resource.hasRefreshError && resource.errorMessage ? <StaleDataBanner errorMessage={resource.errorMessage} lastValidAt={resource.lastRefreshedAt} onRetry={resource.refresh} /> : null}
@@ -78,7 +94,29 @@ export default function AuthorDraftPage({ params }: { params: Promise<{ draftId:
       {message ? <div className={`rounded-lg border p-3 text-xs ${message.tone === "ok" ? "border-[#bcd9c7] bg-mint text-evergreen" : "border-danger/30 bg-danger-soft text-danger"}`}>{message.text}</div> : null}
       <div role="tablist" className="scroll-x flex gap-1 border-b border-line">{([{ id: "canvas", label: "Draft canvas", icon: GitBranch }, { id: "agents", label: "Agents & skills", icon: Bot }, { id: "source", label: "Domain sources", icon: Code2 }, { id: "capabilities", label: "Capabilities", icon: Wrench }, { id: "release", label: "Compile & release", icon: ShieldCheck }] as const).map((item) => <button key={item.id} role="tab" aria-selected={tab === item.id} onClick={() => setTab(item.id)} className={`inline-flex items-center gap-2 border-b-2 px-4 py-2.5 text-xs font-semibold ${tab === item.id ? "border-evergreen text-evergreen" : "border-transparent text-ink-2"}`}><item.icon className="h-3.5 w-3.5" />{item.label}</button>)}</div>
 
-      {tab === "canvas" ? <div className="grid grid-cols-1 gap-5 2xl:grid-cols-[minmax(0,1fr)_390px]"><CategoryGraph nodes={graph.nodes} edges={graph.edges} categories={graph.categories} selectedNodeId={selectedNode?.id ?? null} onSelectNode={setSelectedNodeId} title="Editable domain workflow" /><aside className="card h-fit overflow-hidden"><div className="panel-head"><div><h2 className="text-[13px] font-bold">Node & case-write inspector</h2><p className="mono mt-0.5 text-[11px] text-ink-3">Draft source projection</p></div></div>{selectedNode ? <div className="space-y-4 p-4"><div><span className="eyebrow">{selectedNode.category}</span><h3 className="mt-1 text-sm font-bold">{selectedNode.label}</h3><p className="mono mt-1 text-[10.5px] text-ink-3">{selectedNode.id}</p></div>{selectedNode.subtitle !== "output" ? <div className="rounded-lg border border-line bg-surface-2 p-3"><p className="flex items-center gap-2 text-xs font-bold"><Bot className="h-3.5 w-3.5 text-evergreen" />Attach registered agent</p><select aria-label="Registered agent" className="field mt-2" value={selectedAgentId} onChange={(event) => setSelectedAgentId(event.target.value)}><option value="">Select an agent…</option>{(agents.data?.items ?? []).map(({ agent }) => { const profile = profiles.data?.items.find((item) => item.tierId === agent.modelProfileId); return <option key={agent.id} value={agent.id} disabled={!profile?.enabled}>{agent.name} · {agent.modelProfileId}{profile ? ` · ${profile.resolvedOpenRouterModel}` : " · unresolved"}</option>; })}</select><input aria-label="New agent node ID" className="field mono mt-2" value={newAgentNodeId} onChange={(event) => setNewAgentNodeId(event.target.value)} placeholder={`${selectedNode.id}-agent (optional)`} /><div className="mt-2 grid grid-cols-2 gap-2"><button className="btn btn-ghost" disabled={busy || !selectedAgentId || selectedNode.subtitle === "input" || draft.status === "PUBLISHED"} onClick={() => void attachAgent("replace")}>Replace node</button><button className="btn btn-primary" disabled={busy || !selectedAgentId || draft.status === "PUBLISHED"} onClick={() => void attachAgent("insert-after")}>Insert after</button></div><p className="mt-2 text-[10.5px] text-ink-3">Writes agentRef, skillRefs, model profile, prompt, and schemas into workflow.yaml.</p></div> : null}<JsonViewer data={selectedNode.data} label="Node contract" maxHeight="max-h-[28rem]" /><button className="btn btn-ghost w-full" onClick={() => setTab("source")}><Code2 className="h-3.5 w-3.5" />Edit node and caseWrites in YAML</button></div> : null}</aside></div> : null}
+      {tab === "canvas" ? <div className="grid grid-cols-1 gap-5 2xl:grid-cols-[minmax(0,1fr)_390px]">
+        <CategoryGraph nodes={graph.nodes} edges={graph.edges} categories={graph.categories} selectedNodeId={selectedNode?.id ?? null} onSelectNode={setSelectedNodeId} title="Editable domain workflow" />
+        <aside className="card h-fit overflow-hidden">
+          <div className="panel-head"><div><h2 className="text-[13px] font-bold">Node & case-write inspector</h2><p className="mono mt-0.5 text-[11px] text-ink-3">Draft source projection</p></div></div>
+          {selectedNode ? <div className="space-y-4 p-4">
+            <div><span className="eyebrow">{selectedNode.category}</span><h3 className="mt-1 text-sm font-bold">{selectedNode.label}</h3><p className="mono mt-1 text-[10.5px] text-ink-3">{selectedNode.id}</p></div>
+            {selectedNode.subtitle !== "output" ? <div className="rounded-lg border border-line bg-surface-2 p-3">
+              <p className="flex items-center gap-2 text-xs font-bold"><Bot className="h-3.5 w-3.5 text-evergreen" />Attach registered agent</p>
+              <select aria-label="Registered agent" className="field mt-2" value={selectedAgentId} onChange={(event) => setSelectedAgentId(event.target.value)}><option value="">Select an agent…</option>{(agents.data?.items ?? []).map(({ agent }) => { const profile = profiles.data?.items.find((item) => item.tierId === agent.modelProfileId); return <option key={agent.id} value={agent.id} disabled={!profile?.enabled}>{agent.name} · {agent.modelProfileId}{profile ? ` · ${profile.resolvedOpenRouterModel}` : " · unresolved"} · {agent.caseWrites.length} writes</option>; })}</select>
+              <input aria-label="New agent node ID" className="field mono mt-2" value={newAgentNodeId} onChange={(event) => setNewAgentNodeId(event.target.value)} placeholder={`${selectedNode.id}-agent (optional)`} />
+              <div className="mt-2 grid grid-cols-2 gap-2"><button className="btn btn-ghost" disabled={busy || !selectedAgentId || selectedNode.subtitle === "input" || draft.status === "PUBLISHED"} onClick={() => void attachAgent("replace")}>Replace node</button><button className="btn btn-primary" disabled={busy || !selectedAgentId || draft.status === "PUBLISHED"} onClick={() => void attachAgent("insert-after")}>Insert after</button></div>
+              <p className="mt-2 text-[10.5px] text-ink-3">Writes the agent, skills, model profile, schemas, and default case writes into the draft sources.</p>
+            </div> : null}
+            <div className="rounded-lg border border-line p-3">
+              <div className="flex items-center justify-between gap-2"><div><p className="text-xs font-bold">Case writes</p><p className="mt-0.5 text-[10.5px] text-ink-3">Canonical commands emitted by this node</p></div><button className="btn btn-primary btn-xs" disabled={busy || draft.status === "PUBLISHED"} onClick={() => void saveCaseWrites()}><Save className="h-3.5 w-3.5" />Save</button></div>
+              <textarea aria-label="Node case writes JSON" className="field mono mt-2 min-h-52 resize-y text-[10.5px]" spellCheck={false} value={caseWritesSource} onChange={(event) => setCaseWritesEdit({ key: caseWritesEditKey, source: event.target.value })} />
+              <p className="mt-2 text-[10px] text-ink-3">JSON array · each entry requires commandType, payload, and payloadSchema.</p>
+            </div>
+            <JsonViewer data={selectedNode.data} label="Node contract" maxHeight="max-h-[28rem]" />
+            <button className="btn btn-ghost w-full" onClick={() => setTab("source")}><Code2 className="h-3.5 w-3.5" />Open full workflow YAML</button>
+          </div> : null}
+        </aside>
+      </div> : null}
 
       {tab === "agents" ? <AgentAuthoringPanel agents={agents.data?.items ?? []} skills={skills.data?.items ?? []} profiles={(profiles.data?.items ?? []).filter((profile) => profile.enabled)} busy={busy} onBusy={setBusy} onFeedback={setMessage} onRefresh={refreshAgentRegistry} /> : null}
 

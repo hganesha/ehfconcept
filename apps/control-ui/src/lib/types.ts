@@ -593,7 +593,8 @@ export type SkillRegistryItemView = { skill: SkillRegistrationView; digest: stri
 export type AgentRegistrationView = {
   id: string; name: string; description: string; role: string; prompt: string; modelProfileId: string;
   runtimeTarget: "local_http" | "azure_foundry";
-  skillIds: string[]; primaryCapabilityId?: string; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>;
+  skillIds: string[]; caseWrites: Array<{ commandType: string; when?: string; payload: Record<string, unknown>; payloadSchema: Record<string, unknown> }>;
+  primaryCapabilityId?: string; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>;
   source: AuthoringSourceView; version: string; status: "draft" | "active" | "deprecated";
 };
 export type AgentRegistryItemView = { agent: AgentRegistrationView; digest: string; createdAt: string; updatedAt: string };

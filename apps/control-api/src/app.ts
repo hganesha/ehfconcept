@@ -16,7 +16,7 @@ import {
   evaluateCompiledPlan,
 } from "./authoring.js";
 import { importAgentBundle } from "./agent-import.js";
-import { applyAgentToAuthoringSources } from "./authoring-agents.js";
+import { applyAgentToAuthoringSources, updateNodeCaseWrites } from "./authoring-agents.js";
 
 export function buildControlApi(options: { db?: Database } = {}) {
   const app = Fastify({ logger: true });
@@ -115,11 +115,16 @@ export function buildControlApi(options: { db?: Database } = {}) {
       if (typeof body.expectedRevision !== "number" || typeof body.nodeId !== "string" || (body.mode !== "replace" && body.mode !== "insert-after")) {
         return reply.code(400).send({ error: "authoring.agent_attachment_invalid" });
       }
-      const [draft, registered] = await Promise.all([getAuthoringDraft(db, request.params.draftId), getAuthoringAgent(db, request.params.agentId)]);
+      const [draft, registered, registeredSkills] = await Promise.all([
+        getAuthoringDraft(db, request.params.draftId),
+        getAuthoringAgent(db, request.params.agentId),
+        listAuthoringSkills(db),
+      ]);
       if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
       if (!registered) return reply.code(404).send({ error: "authoring.agent_not_found" });
       const sources = applyAgentToAuthoringSources({
         packageSource: draft.packageSource, workflowSource: draft.workflowSource, agent: registered.agent,
+        skills: registeredSkills.map((item) => item.skill),
         nodeId: body.nodeId, mode: body.mode, ...(typeof body.newNodeId === "string" ? { newNodeId: body.newNodeId } : {}),
       });
       const analysis = analyzeAuthoringSources(sources.packageSource, sources.workflowSource);
@@ -131,6 +136,28 @@ export function buildControlApi(options: { db?: Database } = {}) {
       return { draft: updated, attachedNodeId: sources.attachedNodeId };
     } catch (error) {
       const message = error instanceof Error ? error.message : "authoring.agent_attachment_failed";
+      return reply.code(message.includes("conflict") ? 409 : 400).send({ error: message });
+    }
+  });
+  app.put<{ Params: { draftId: string; nodeId: string } }>("/v1/authoring/drafts/:draftId/nodes/:nodeId/case-writes", async (request, reply) => {
+    try {
+      const body = (request.body ?? {}) as { expectedRevision?: unknown; caseWrites?: unknown };
+      if (typeof body.expectedRevision !== "number" || !Array.isArray(body.caseWrites)) {
+        return reply.code(400).send({ error: "authoring.case_writes_update_invalid" });
+      }
+      const draft = await getAuthoringDraft(db, request.params.draftId);
+      if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
+      const workflowSource = updateNodeCaseWrites(draft.workflowSource, request.params.nodeId, body.caseWrites);
+      const analysis = analyzeAuthoringSources(draft.packageSource, workflowSource);
+      const caseWriteErrors = analysis.diagnostics.filter((item) => item.severity === "error" && item.path.includes(`nodes.${request.params.nodeId}.config.caseWrites`));
+      if (caseWriteErrors.length) return reply.code(422).send({ error: "authoring.case_writes_invalid", diagnostics: caseWriteErrors });
+      return await updateAuthoringSources(db, draft.draftId, {
+        expectedRevision: body.expectedRevision, packageSource: draft.packageSource, workflowSource,
+        parsedPackage: analysis.parsedPackage, parsedWorkflow: analysis.parsedWorkflow, ...analysis.metadata,
+        diagnostics: analysis.diagnostics, actor: actor(request.headers),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "authoring.case_writes_update_failed";
       return reply.code(message.includes("conflict") ? 409 : 400).send({ error: message });
     }
   });

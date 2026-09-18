@@ -228,7 +228,7 @@ export async function compileAuthoringDraft(input: {
     if (!capabilityMap.has(capabilityId)) diagnostics.push(diagnostic("compiler.skill_capability_unresolved", `package.skills.${index}.allowedCapabilityIds`, `Skill ${skill.id} references unresolved capability ${capabilityId}.`));
   }));
   agents.forEach((agent, index) => {
-    if (!capabilityMap.has(agent.primaryCapabilityId)) diagnostics.push(diagnostic("compiler.agent_capability_unresolved", `package.agents.${index}.primaryCapabilityId`, `Agent ${agent.id} references unresolved capability ${agent.primaryCapabilityId}.`));
+    if (agent.primaryCapabilityId && !capabilityMap.has(agent.primaryCapabilityId)) diagnostics.push(diagnostic("compiler.agent_capability_unresolved", `package.agents.${index}.primaryCapabilityId`, `Agent ${agent.id} references unresolved capability ${agent.primaryCapabilityId}.`));
   });
   if (diagnostics.some((item) => item.severity === "error")) return { plan: null, diagnostics };
 

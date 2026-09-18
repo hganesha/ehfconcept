@@ -1245,3 +1245,10 @@ export async function attachAuthoringAgentView(draftId: string, agentId: string,
   });
   return { draft: mapAuthoringDraft(result.draft), attachedNodeId: result.attachedNodeId };
 }
+
+export async function updateNodeCaseWritesView(draftId: string, nodeId: string, input: { expectedRevision: number; caseWrites: unknown[] }): Promise<AuthoringDraftView> {
+  const draft = await apiJson<RawAuthoringDraft>(controlBase, `/v1/authoring/drafts/${encodeURIComponent(decodeURIComponent(draftId))}/nodes/${encodeURIComponent(nodeId)}/case-writes`, {
+    method: "PUT", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input),
+  });
+  return mapAuthoringDraft(draft);
+}
