@@ -64,3 +64,21 @@ describe("adapters", () => {
     });
   });
 });
+
+describe("model credential handling", () => {
+  const profile = {
+    id: "model.standard.v1", provider: "openrouter" as const, model: "test/model",
+    maxOutputTokens: 256, timeoutMs: 1000, maxConcurrency: 1,
+  };
+
+  it("falls back to the recorded adapter when that is permitted", async () => {
+    const result = await invokeModel({ profile, input: { prompt: "kyc decision" } });
+    expect(result.provider).toBe("recorded");
+  });
+
+  it("fails closed when a real provider is expected", async () => {
+    // A silent fallback lets a deployment report model calls it never made.
+    await expect(invokeModel({ profile, input: {}, allowRecordedFallback: false }))
+      .rejects.toThrow("adapter.model_credential_missing");
+  });
+});

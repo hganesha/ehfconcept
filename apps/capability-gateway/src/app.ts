@@ -13,6 +13,7 @@ import { verifyExecutionEnvelope } from "@ehf/execution-auth";
 import {
   AuthorizationError,
   createGuard,
+  isAzureMode,
   createWorkloadResolverFromEnv,
   DelegatedPrincipalResolver,
   type AuthorizationDecision,
@@ -26,8 +27,9 @@ import {
   getPlan,
   getRun,
   listRegisteredCapabilities,
-  recordCapabilityUsage,
+  recordCapabilityCost,
   registerCapability,
+  reserveCapabilityBudget,
   reserveGatewayReceipt,
   type Database,
 } from "@ehf/persistence";
@@ -82,6 +84,19 @@ function envelopeToken(headers: Record<string, string | string[] | undefined>): 
 
 function expectedDenial(code: string): boolean {
   return code.includes("denied") || code.includes("authorization") || code.includes("stale_fence");
+}
+
+/**
+ * Whether a missing provider credential may fall back to the recorded adapter.
+ *
+ * Locally the deterministic adapter is what makes the POC testable offline. In Azure a
+ * silent fallback would let a deployment report successful model calls it never made, so
+ * the absent credential has to fail closed instead.
+ */
+function recordedFallbackAllowed(env: NodeJS.ProcessEnv): boolean {
+  if (env.MODEL_RECORDED_FALLBACK === "deny") return false;
+  if (env.MODEL_RECORDED_FALLBACK === "allow") return true;
+  return !isAzureMode(env);
 }
 
 export function buildGateway(options: GatewayOptions = {}) {
@@ -224,9 +239,16 @@ export function buildGateway(options: GatewayOptions = {}) {
           capability = resolved;
           const run = await getRun(db, claims.run_id);
           if (!run) throw new Error("gateway.run_not_found");
-          if (run.capabilityCalls >= plan.budgets.maxCapabilityCalls) throw new Error("gateway.capability_budget_denied");
-          if (capability.kind === "model" && run.modelCalls >= plan.budgets.maxModelCalls) throw new Error("gateway.model_budget_denied");
-          if (run.costUsd >= plan.budgets.maxCostUsd) throw new Error("gateway.cost_budget_denied");
+          // Reserved, not merely checked: the counters move in the same statement that
+          // tests them, so concurrent nodes cannot both pass against the same counts.
+          const reserved = await reserveCapabilityBudget(db, {
+            runId: claims.run_id,
+            modelCall: capability.kind === "model",
+            maxCapabilityCalls: plan.budgets.maxCapabilityCalls,
+            maxModelCalls: plan.budgets.maxModelCalls,
+            maxCostUsd: plan.budgets.maxCostUsd,
+          });
+          if (!reserved) throw new Error("gateway.budget_denied");
           authSpan.setAttributes({
             "harness.authorization.outcome": "ALLOWED",
             "harness.authorization.reason": "permission.envelope_allowed",
@@ -299,10 +321,11 @@ export function buildGateway(options: GatewayOptions = {}) {
               return invokeModel({
                 profile,
                 input: invocation.input,
+                allowRecordedFallback: recordedFallbackAllowed(env),
                 ...(capability.outputSchema ? { outputSchema: capability.outputSchema } : {}),
-                ...(process.env.OPENROUTER_API_KEY ? { apiKey: process.env.OPENROUTER_API_KEY } : {}),
-                ...(process.env.OPENROUTER_SITE_URL ? { siteUrl: process.env.OPENROUTER_SITE_URL } : {}),
-                ...(process.env.OPENROUTER_APP_NAME ? { appName: process.env.OPENROUTER_APP_NAME } : {}),
+                ...(env.OPENROUTER_API_KEY ? { apiKey: env.OPENROUTER_API_KEY } : {}),
+                ...(env.OPENROUTER_SITE_URL ? { siteUrl: env.OPENROUTER_SITE_URL } : {}),
+                ...(env.OPENROUTER_APP_NAME ? { appName: env.OPENROUTER_APP_NAME } : {}),
               });
             })()
             : await invokeSimulator(capability.adapterBindingId.replace(/^simulator:/, ""), invocation.input);
@@ -331,9 +354,7 @@ export function buildGateway(options: GatewayOptions = {}) {
         };
         const result: CapabilityResult = { ...unsigned, receiptDigest: stableDigest(unsigned) };
         await completeGatewayReceipt(db, result);
-        await recordCapabilityUsage(db, {
-          runId: claims.run_id, modelCall: capability.kind === "model", costUsd: adapter.costUsd,
-        });
+        await recordCapabilityCost(db, { runId: claims.run_id, costUsd: adapter.costUsd });
         span.setAttributes({ "harness.outcome": "SUCCEEDED", "harness.gateway.receipt_replayed": false });
         return result;
       } catch (error) {

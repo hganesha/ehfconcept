@@ -97,6 +97,8 @@ services:
       <<: *runtime-env
       CASE_API_PORT: "4102"
       EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
+      OUTBOX_INTERVAL_MS: ${OUTBOX_INTERVAL_MS:-5000}
+      OUTBOX_RETENTION_DAYS: ${OUTBOX_RETENTION_DAYS:-7}
     ports:
       - "4102:4102"
     depends_on:
@@ -167,6 +169,9 @@ services:
       FOUNDRY_TOKEN_SCOPE: ${FOUNDRY_TOKEN_SCOPE:-https://ai.azure.com/.default}
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
       WORKER_LEASE_SECONDS: "60"
+      WORKER_RETRY_BASE_MS: ${WORKER_RETRY_BASE_MS:-2000}
+      WORKER_RETRY_MAX_MS: ${WORKER_RETRY_MAX_MS:-60000}
+      RUNTIME_GRANT_SECRET: ${RUNTIME_GRANT_SECRET:-local-runtime-grant-secret-change-before-share}
     depends_on:
       runtime-host-local:
         condition: service_healthy

@@ -750,19 +750,54 @@ export async function listGatewayReceipts(
   }));
 }
 
-export async function recordCapabilityUsage(
+/**
+ * Claim one capability call against a run's budget.
+ *
+ * The gateway used to read the counters, decide, call the provider, and only then record
+ * the usage. Two nodes running concurrently both passed the check against the same
+ * stale counts and both spent, so a plan could exceed its own budget -- at
+ * maxConcurrency 1 it never showed, at 32 it would. The check and the increment are one
+ * statement, so the budget is a reservation rather than an observation.
+ *
+ * A reservation is not released when the call fails: an attempt that reached a paid
+ * provider may have cost money whatever it returned, and a budget that refunds failures
+ * can be spent indefinitely by failing.
+ */
+export async function reserveCapabilityBudget(
   db: Database,
-  input: { runId: string; modelCall: boolean; costUsd: number | null },
-): Promise<void> {
-  await db.query(`
+  input: {
+    runId: string;
+    modelCall: boolean;
+    maxCapabilityCalls: number;
+    maxModelCalls: number;
+    maxCostUsd: number;
+  },
+): Promise<boolean> {
+  const result = await db.query(`
     update harness_runtime.runs
     set capability_calls = capability_calls + 1,
         model_calls = model_calls + case when $2 then 1 else 0 end,
-        cost_usd = cost_usd + coalesce($3::numeric, 0::numeric),
-        cost_complete = cost_complete and ($3 is not null),
         updated_at = now()
     where run_id = $1
-  `, [input.runId, input.modelCall, input.costUsd]);
+      and capability_calls < $3
+      and (not $2 or model_calls < $4)
+      and cost_usd < $5::numeric
+  `, [input.runId, input.modelCall, input.maxCapabilityCalls, input.maxModelCalls, input.maxCostUsd]);
+  return (result.rowCount ?? 0) === 1;
+}
+
+/** Add the realized cost of a reserved call once the provider has reported it. */
+export async function recordCapabilityCost(
+  db: Database,
+  input: { runId: string; costUsd: number | null },
+): Promise<void> {
+  await db.query(`
+    update harness_runtime.runs
+    set cost_usd = cost_usd + coalesce($2::numeric, 0::numeric),
+        cost_complete = cost_complete and ($2 is not null),
+        updated_at = now()
+    where run_id = $1
+  `, [input.runId, input.costUsd]);
 }
 
 export type AuthoringDiagnostic = {
