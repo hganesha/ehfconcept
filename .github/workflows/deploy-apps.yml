@@ -13,12 +13,8 @@ on:
         type: environment
         required: true
         default: poc
-      services-image:
-        description: 'Digest-pinned services image. Leave empty to build from this revision.'
-        type: string
-        required: false
-      ui-image:
-        description: 'Digest-pinned control surface image. Leave empty to build from this revision.'
+      images:
+        description: 'JSON map of service to digest-pinned image, from a previous build. Leave empty to build from this revision.'
         type: string
         required: false
 
@@ -32,13 +28,13 @@ concurrency:
 
 jobs:
   validate:
-    if: inputs.services-image == '' || inputs.ui-image == ''
+    if: inputs.images == ''
     uses: ./.github/workflows/validate.yml
 
   build:
     # Only builds when digests were not supplied. Passing digests is how a
     # validated release is promoted between environments without a rebuild.
-    if: inputs.services-image == '' || inputs.ui-image == ''
+    if: inputs.images == ''
     needs: validate
     uses: ./.github/workflows/build-images.yml
     with:
@@ -52,9 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     env:
-      # Consumed directly by infra/environments/poc.apps.bicepparam.
-      SERVICES_IMAGE: ${{ inputs.services-image != '' && inputs.services-image || needs.build.outputs.services-image }}
-      UI_IMAGE: ${{ inputs.ui-image != '' && inputs.ui-image || needs.build.outputs.ui-image }}
+      IMAGES: ${{ inputs.images != '' && inputs.images || needs.build.outputs.images }}
       SOURCE_REVISION: ${{ github.sha }}
       NAME_PREFIX: ${{ vars.NAME_PREFIX || 'hf' }}
     steps:
@@ -86,17 +80,28 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: check images are digest-pinned
+      # Each image becomes the environment variable its parameter file reads.
+      - name: resolve and check images
         run: |
           set -euo pipefail
-          for image in "$SERVICES_IMAGE" "$UI_IMAGE"; do
+          declare -A vars=(
+            [migrate]=MIGRATE_IMAGE
+            [control-api]=CONTROL_API_IMAGE
+            [case-api]=CASE_API_IMAGE
+            [gateway]=GATEWAY_IMAGE
+            [runtime-host]=RUNTIME_HOST_IMAGE
+            [dispatcher]=DISPATCHER_IMAGE
+            [control-ui]=UI_IMAGE
+          )
+          for service in "${!vars[@]}"; do
+            image="$(jq -r --arg k "$service" '.[$k] // ""' <<<"$IMAGES")"
             if [[ "$image" != *"@sha256:"* ]]; then
-              echo "refusing to deploy '${image}': images must be pinned by digest" >&2
+              echo "refusing to deploy '${service}' as '${image}': images must be pinned by digest" >&2
               exit 1
             fi
+            echo "${vars[$service]}=${image}" >> "$GITHUB_ENV"
+            printf '%-14s %s\n' "$service" "$image"
           done
-          echo "services: $SERVICES_IMAGE"
-          echo "ui:       $UI_IMAGE"
 
       # The foundation deployment is the source of truth for names and
       # endpoints, so nothing here re-derives them.
@@ -191,8 +196,7 @@ jobs:
             echo "| Item | Value |"
             echo "| --- | --- |"
             echo "| Source revision | \`${{ github.sha }}\` |"
-            echo "| Services image | \`${SERVICES_IMAGE}\` |"
-            echo "| Control surface image | \`${UI_IMAGE}\` |"
+            jq -r 'to_entries[] | "| \(.key) image | `\(.value)` |"' <<<"$IMAGES"
             echo "| Control surface | ${{ steps.workloads.outputs.url }} |"
             echo
             echo 'Sign-in must already be configured on the control surface app'

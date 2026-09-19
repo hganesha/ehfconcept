@@ -19,12 +19,9 @@ on:
         type: string
         required: true
     outputs:
-      services-image:
-        description: 'Digest-pinned image for the Node services'
-        value: ${{ jobs.build.outputs.services-image }}
-      ui-image:
-        description: 'Digest-pinned image for the control surface'
-        value: ${{ jobs.build.outputs.ui-image }}
+      images:
+        description: 'JSON object mapping each service to its digest-pinned image'
+        value: ${{ jobs.build.outputs.images }}
 
 permissions:
   contents: read
@@ -36,8 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     outputs:
-      services-image: ${{ steps.pin.outputs.services-image }}
-      ui-image: ${{ steps.pin.outputs.ui-image }}
+      images: ${{ steps.pin.outputs.images }}
     steps:
       - uses: actions/checkout@v5
 
@@ -77,14 +73,31 @@ jobs:
           echo "login-server=${login_server}" >> "$GITHUB_OUTPUT"
           echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      # One image serves every Node workload; the control surface is a separate
-      # standalone Next.js build.
-      - name: build services image
+      # The Dockerfile prunes the workspace per service with SERVICE_FILTER and
+      # bakes in the Rust compiler of record, so each service gets its own image
+      # rather than one image serving every workload.
+      - name: build service images
         run: |
-          az acr build --registry "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
-            --platform linux/amd64 \
-            --image "ehf/services:${{ steps.registry.outputs.tag }}" \
-            --file Dockerfile .
+          set -euo pipefail
+          build() {
+            local repo="$1" filter="$2" filter2="${3:-}"
+            local args=(--registry "${{ vars.AZURE_CONTAINER_REGISTRY }}"
+                        --platform linux/amd64
+                        --image "ehf/${repo}:${{ steps.registry.outputs.tag }}"
+                        --file Dockerfile
+                        --build-arg "SERVICE_FILTER=${filter}")
+            [[ -n "$filter2" ]] && args+=(--build-arg "SERVICE_FILTER_2=${filter2}")
+            echo "::group::${repo}"
+            az acr build "${args[@]}" .
+            echo "::endgroup::"
+          }
+
+          build migrate      "@ehf/persistence..."        "@ehf/case-store..."
+          build control-api  "@ehf/control-api..."
+          build case-api     "@ehf/case-api..."
+          build gateway      "@ehf/capability-gateway..."
+          build runtime-host "@ehf/runtime-host..."
+          build dispatcher   "@ehf/runtime-worker..."
 
       - name: build control surface image
         run: |
@@ -97,28 +110,24 @@ jobs:
         id: pin
         run: |
           set -euo pipefail
-          services_digest="$(az acr repository show \
-            -n "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
-            --image "ehf/services:${{ steps.registry.outputs.tag }}" \
-            --query digest -o tsv)"
-          ui_digest="$(az acr repository show \
-            -n "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
-            --image "ehf/control-ui:${{ steps.registry.outputs.tag }}" \
-            --query digest -o tsv)"
-
-          services_image="${{ steps.registry.outputs.login-server }}/ehf/services@${services_digest}"
-          ui_image="${{ steps.registry.outputs.login-server }}/ehf/control-ui@${ui_digest}"
-
-          echo "services-image=${services_image}" >> "$GITHUB_OUTPUT"
-          echo "ui-image=${ui_image}" >> "$GITHUB_OUTPUT"
+          images='{}'
+          for repo in migrate control-api case-api gateway runtime-host dispatcher control-ui; do
+            digest="$(az acr repository show \
+              -n "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
+              --image "ehf/${repo}:${{ steps.registry.outputs.tag }}" \
+              --query digest -o tsv)"
+            ref="${{ steps.registry.outputs.login-server }}/ehf/${repo}@${digest}"
+            images="$(jq -c --arg k "$repo" --arg v "$ref" '. + {($k): $v}' <<<"$images")"
+            printf '%-14s %s\n' "$repo" "$digest"
+          done
+          echo "images=${images}" >> "$GITHUB_OUTPUT"
 
           {
             echo '## Images'
             echo
-            echo "| Image | Digest |"
+            echo "| Service | Image |"
             echo "| --- | --- |"
-            echo "| ehf/services | \`${services_digest}\` |"
-            echo "| ehf/control-ui | \`${ui_digest}\` |"
+            jq -r 'to_entries[] | "| \(.key) | `\(.value)` |"' <<<"$images"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # The promotion unit from the migration plan, section 10. Promote this
@@ -129,21 +138,14 @@ jobs:
           set -euo pipefail
           jq -n \
             --arg sourceRevision "${{ github.sha }}" \
-            --arg services "${{ steps.pin.outputs.services-image }}" \
-            --arg ui "${{ steps.pin.outputs.ui-image }}" \
             --arg runId "${{ github.run_id }}" \
+            --argjson images '${{ steps.pin.outputs.images }}' \
             '{
                sourceRevision: $sourceRevision,
                buildRunId: $runId,
-               serviceImages: {
-                 "control-api": $services,
-                 "case-api": $services,
-                 "capability-gateway": $services,
-                 "runtime-host": $services,
-                 "runtime-dispatcher": $services,
-                 "control-ui": $ui
-               },
+               serviceImages: $images,
                runtimeProvider: "local_http",
+               platformMode: "local",
                foundryAgent: null
              }' > release-manifest.json
           cat release-manifest.json

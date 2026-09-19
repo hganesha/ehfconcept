@@ -9,7 +9,9 @@
 //
 //   az deployment group create -g <rg> -f infra/apps.bicep \
 //     -p infra/environments/poc.apps.bicepparam \
-//     -p servicesImage=<acr>/ehf/services@sha256:... uiImage=<acr>/ehf/control-ui@sha256:...
+//   with the per-service image digests exported as MIGRATE_IMAGE,
+//   CONTROL_API_IMAGE, CASE_API_IMAGE, GATEWAY_IMAGE, RUNTIME_HOST_IMAGE,
+//   DISPATCHER_IMAGE, and UI_IMAGE.
 //
 // Environment variables below mirror compose.yaml service by service. Changing
 // one here without changing it there breaks local/Azure parity, which is the
@@ -38,8 +40,25 @@ param registryLoginServer string
 @description('Key Vault URI, without a trailing slash.')
 param keyVaultUri string
 
-@description('Digest-pinned image for every Node service. Never a tag.')
-param servicesImage string
+// The Dockerfile now prunes the workspace per service with SERVICE_FILTER, so
+// each service has its own image rather than sharing one. Every one is a digest.
+@description('Digest-pinned image for the migration job (persistence + case-store).')
+param migrateImage string
+
+@description('Digest-pinned image for the control API.')
+param controlApiImage string
+
+@description('Digest-pinned image for the case API.')
+param caseApiImage string
+
+@description('Digest-pinned image for the capability gateway.')
+param gatewayImage string
+
+@description('Digest-pinned image for the runtime host.')
+param runtimeHostImage string
+
+@description('Digest-pinned image for the runtime dispatcher.')
+param dispatcherImage string
 
 @description('Digest-pinned image for the Next.js control surface. Never a tag.')
 param uiImage string
@@ -102,6 +121,12 @@ param controlUiApproverId string = 'local-approver'
 
 @description('Roles for the approver principal.')
 param controlUiApproverRoles string = 'Harness.Reader,Harness.Approver'
+
+@description('Sign the configured local principal in automatically. Only meaningful in local identity mode.')
+param controlUiLocalAutologin string = 'true'
+
+@description('Allow the configured approver principal to approve without an interactive step. Local identity mode only.')
+param controlUiLocalAutomatedApproval string = 'true'
 
 @description('Runtime provider binding. azure_foundry additionally requires the Foundry parameters and the hosted-agent wrapper from AZ-011.')
 @allowed(['local_http', 'azure_foundry'])
@@ -338,11 +363,14 @@ module migrateJob 'modules/container-job.bicep' = {
     location: location
     tags: tags
     environmentId: environment.id
-    image: servicesImage
+    image: migrateImage
     identityId: migrateIdentity.id
     registryServer: registryLoginServer
     command: ['/bin/sh']
-    args: ['-c', 'pnpm db:migrate']
+    args: [
+      '-c'
+      './packages/persistence/node_modules/.bin/tsx packages/persistence/src/migrate.ts && ./packages/case-store/node_modules/.bin/tsx packages/case-store/src/migrate.ts'
+    ]
     secrets: databaseSecret(migrateIdentity.id)
     env: concat(
       [
@@ -407,11 +435,11 @@ module gateway 'modules/container-app.bicep' = if (!migrationOnly) {
     location: location
     tags: tags
     environmentId: environment.id
-    image: servicesImage
+    image: gatewayImage
     identityId: gatewayIdentity.id
     registryServer: registryLoginServer
-    command: ['/bin/sh']
-    args: ['-c', 'pnpm --filter @ehf/capability-gateway start']
+    command: ['./apps/capability-gateway/node_modules/.bin/tsx']
+    args: ['apps/capability-gateway/src/server.ts']
     ingressTargetPort: 4101
     probes: httpProbes(4101)
     minReplicas: minReplicas
@@ -493,11 +521,11 @@ module caseApi 'modules/container-app.bicep' = if (!migrationOnly) {
     location: location
     tags: tags
     environmentId: environment.id
-    image: servicesImage
+    image: caseApiImage
     identityId: caseApiIdentity.id
     registryServer: registryLoginServer
-    command: ['/bin/sh']
-    args: ['-c', 'pnpm --filter @ehf/case-api start']
+    command: ['./apps/case-api/node_modules/.bin/tsx']
+    args: ['apps/case-api/src/server.ts']
     ingressTargetPort: 4102
     probes: httpProbes(4102)
     minReplicas: minReplicas
@@ -571,11 +599,11 @@ module controlApi 'modules/container-app.bicep' = if (!migrationOnly) {
     location: location
     tags: tags
     environmentId: environment.id
-    image: servicesImage
+    image: controlApiImage
     identityId: controlApiIdentity.id
     registryServer: registryLoginServer
-    command: ['/bin/sh']
-    args: ['-c', 'pnpm --filter @ehf/control-api start']
+    command: ['./apps/control-api/node_modules/.bin/tsx']
+    args: ['apps/control-api/src/server.ts']
     ingressTargetPort: 4100
     probes: httpProbes(4100)
     minReplicas: minReplicas
@@ -643,13 +671,13 @@ module runtimeHost 'modules/container-app.bicep' = if (!migrationOnly) {
     location: location
     tags: tags
     environmentId: environment.id
-    image: servicesImage
+    image: runtimeHostImage
     identityId: runtimeHostIdentity.id
     registryServer: registryLoginServer
     // Invoke the checked-in runtime directly so the container never asks pnpm
     // to repair or relink the workspace at startup.
-    command: ['/bin/sh']
-    args: ['-c', './node_modules/.bin/tsx apps/runtime-host/src/server.ts']
+    command: ['./apps/runtime-host/node_modules/.bin/tsx']
+    args: ['apps/runtime-host/src/server.ts']
     ingressTargetPort: 8088
     probes: httpProbes(8088)
     minReplicas: minReplicas
@@ -728,11 +756,11 @@ module dispatcher 'modules/container-app.bicep' = if (!migrationOnly) {
     location: location
     tags: tags
     environmentId: environment.id
-    image: servicesImage
+    image: dispatcherImage
     identityId: dispatcherIdentity.id
     registryServer: registryLoginServer
-    command: ['/bin/sh']
-    args: ['-c', 'pnpm --filter @ehf/runtime-worker start']
+    command: ['./apps/runtime-worker/node_modules/.bin/tsx']
+    args: ['apps/runtime-worker/src/worker.ts']
     ingressEnabled: false
     minReplicas: 1
     maxReplicas: 1
@@ -794,6 +822,12 @@ module dispatcher 'modules/container-app.bicep' = if (!migrationOnly) {
         {
           name: 'WORKER_LEASE_SECONDS'
           value: '60'
+        }
+        // In-process claim concurrency. Leases and fencing epochs make this safe;
+        // the single replica below keeps demo traces readable.
+        {
+          name: 'WORKER_CONCURRENCY'
+          value: '2'
         }
         {
           name: 'WORKER_POLL_MS'
@@ -901,6 +935,14 @@ module controlUi 'modules/container-app.bicep' = if (!migrationOnly) {
         {
           name: 'CONTROL_UI_APPROVER_ROLES'
           value: controlUiApproverRoles
+        }
+        {
+          name: 'CONTROL_UI_LOCAL_AUTOLOGIN'
+          value: controlUiLocalAutologin
+        }
+        {
+          name: 'CONTROL_UI_LOCAL_AUTOMATED_APPROVAL'
+          value: controlUiLocalAutomatedApproval
         }
         {
           name: 'CONTROL_UI_VERSION'

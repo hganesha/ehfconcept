@@ -77,7 +77,7 @@ is.
 | `NAME_PREFIX`, `ENVIRONMENT_SUFFIX` | all | your naming convention; default `hf` / `poc` |
 | `KEY_VAULT_NAME`, `POSTGRES_SERVER_NAME`, `POSTGRES_SUBNET_ID`, `POSTGRES_DNS_ZONE_ID` | 3 | `main.bicep` outputs |
 | `CONTAINER_APPS_ENVIRONMENT_NAME`, `REGISTRY_LOGIN_SERVER`, `KEY_VAULT_URI` | 4 | `main.bicep` outputs |
-| `SERVICES_IMAGE`, `UI_IMAGE` | 4 | `build-images.yml`; must contain `@sha256:` |
+| `MIGRATE_IMAGE`, `CONTROL_API_IMAGE`, `CASE_API_IMAGE`, `GATEWAY_IMAGE`, `RUNTIME_HOST_IMAGE`, `DISPATCHER_IMAGE`, `UI_IMAGE` | 4 | `build-images.yml`; each must contain `@sha256:` |
 | `MIGRATION_ONLY` | 4 | `true` for the first pass of a release |
 | `SOURCE_REVISION` | 4 | commit SHA, recorded on the control surface |
 | `RUNTIME_PROVIDER`, `FOUNDRY_*` | 4 | only when switching execution to Foundry |
@@ -117,7 +117,12 @@ az deployment group create -g "$RG" -f infra/database.bicep \
 export CONTAINER_APPS_ENVIRONMENT_NAME="$(jq -r .containerAppsEnvironmentName.value outputs.json)"
 export REGISTRY_LOGIN_SERVER="$(jq -r .registryLoginServer.value outputs.json)"
 export KEY_VAULT_URI="$(jq -r .keyVaultUri.value outputs.json)"
-export SERVICES_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/services@sha256:..."
+export MIGRATE_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/migrate@sha256:..."
+export CONTROL_API_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/control-api@sha256:..."
+export CASE_API_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/case-api@sha256:..."
+export GATEWAY_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/gateway@sha256:..."
+export RUNTIME_HOST_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/runtime-host@sha256:..."
+export DISPATCHER_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/dispatcher@sha256:..."
 export UI_IMAGE="${REGISTRY_LOGIN_SERVER}/ehf/control-ui@sha256:..."
 
 MIGRATION_ONLY=true az deployment group create -g "$RG" -f infra/apps.bicep \
@@ -136,7 +141,8 @@ az deployment group create -g "$RG" -f infra/apps.bicep \
                          shellcheck; gates every deployment
   infra-plan.yml         what-if on pull requests touching infra/
   deploy-foundation.yml  stages 1-3
-  build-images.yml       az acr build, digest resolution, release manifest
+  build-images.yml       az acr build per service (SERVICE_FILTER), digest
+                         resolution, release manifest
   deploy-apps.yml        stage 4: migrations first, then workloads
   smoke.yml              deployment-shape checks, on demand and daily
 ```
@@ -167,6 +173,10 @@ that is not a synthetic-data POC.
 completion, and only then rolls the services. A failed migration stops the run
 with every service still on the previous image. The workflow also refuses any
 image reference without `@sha256:`, so a mutable tag cannot reach a revision.
+
+Each service has its own image: `Dockerfile` prunes the workspace to one
+service with `SERVICE_FILTER` and bakes in the Rust compiler of record, so the
+build step produces seven images rather than two.
 
 ## What this does not create
 

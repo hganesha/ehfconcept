@@ -29,7 +29,7 @@ ca-hf-runtime-dispatcher   no ingress, polls the run queue
         ├─► ca-hf-capability-gateway
         └─► ca-hf-case-api
 
-job-hf-migrate             manual Container Apps job, runs `pnpm db:migrate`
+job-hf-migrate             manual Container Apps job, runs both migrations
 
 psql-hf-poc…               PostgreSQL Flexible Server, VNet-injected, private DNS
 kv-hf-poc…                 Key Vault: envelope secret, runtime token, DB URL, model key
@@ -37,12 +37,24 @@ cr hf poc…                 Container Registry: two digest-pinned images
 log-/appi-hf-poc…          Log Analytics + Application Insights
 ```
 
-Two images are built from the repository:
+Seven images are built from the repository. `Dockerfile` prunes the workspace to
+one service with the `SERVICE_FILTER` build argument and bakes in the Rust
+compiler of record, so each service ships only its own dependencies and runs as a
+non-root user:
 
-| Image | Dockerfile | Used by |
+| Image | Build argument | Runs |
 | --- | --- | --- |
-| `ehf/services` | `Dockerfile` | migrate job, control-api, case-api, capability-gateway, runtime-host, runtime-dispatcher |
-| `ehf/control-ui` | `Dockerfile.ui` | control-ui |
+| `ehf/migrate` | `@ehf/persistence...` + `@ehf/case-store...` | the two migration entrypoints, in order |
+| `ehf/control-api` | `@ehf/control-api...` | `apps/control-api/src/server.ts` |
+| `ehf/case-api` | `@ehf/case-api...` | `apps/case-api/src/server.ts` |
+| `ehf/gateway` | `@ehf/capability-gateway...` | `apps/capability-gateway/src/server.ts` |
+| `ehf/runtime-host` | `@ehf/runtime-host...` | `apps/runtime-host/src/server.ts` |
+| `ehf/dispatcher` | `@ehf/runtime-worker...` | `apps/runtime-worker/src/worker.ts` |
+| `ehf/control-ui` | built from `Dockerfile.ui` | the standalone Next.js server |
+
+Each container invokes its own checked-in `tsx` binary directly
+(`./apps/<service>/node_modules/.bin/tsx`), so a read-only, non-root container
+never asks pnpm to repair or relink the workspace at startup.
 
 ### 0.2 What this runbook does **not** claim
 
@@ -576,32 +588,57 @@ echo "RELEASE_TAG=$RELEASE_TAG"
 
 Commit or stash local changes first: the tag must identify exactly what is being deployed.
 
-### 5.2 Build both images
+### 5.2 Build the images
 
 ```bash
-az acr build --registry "$ACR" --platform linux/amd64 \
-  --image "ehf/services:${RELEASE_TAG}" --file Dockerfile .
+build_service() {
+  local repo="$1" filter="$2" filter2="${3:-}"
+  local args=(--registry "$ACR" --platform linux/amd64
+              --image "ehf/${repo}:${RELEASE_TAG}"
+              --file Dockerfile
+              --build-arg "SERVICE_FILTER=${filter}")
+  [[ -n "$filter2" ]] && args+=(--build-arg "SERVICE_FILTER_2=${filter2}")
+  az acr build "${args[@]}" .
+}
+
+build_service migrate      "@ehf/persistence..."        "@ehf/case-store..."
+build_service control-api  "@ehf/control-api..."
+build_service case-api     "@ehf/case-api..."
+build_service gateway      "@ehf/capability-gateway..."
+build_service runtime-host "@ehf/runtime-host..."
+build_service dispatcher   "@ehf/runtime-worker..."
 
 az acr build --registry "$ACR" --platform linux/amd64 \
   --image "ehf/control-ui:${RELEASE_TAG}" --file Dockerfile.ui .
 ```
 
-The services build takes several minutes on first run (`pnpm install --frozen-lockfile` for the whole workspace). The UI build additionally runs `pnpm --filter @ehf/control-ui build`.
+The first build is the slow one: `Dockerfile` compiles `harnessc` with
+`cargo build --release` in its first stage. The author plane shells out to that
+binary, so an image without it cannot emit plans at all — which is the intended
+failure mode, not a packaging accident.
 
 ### 5.3 Resolve digests and pin them
 
 ```bash
-export SERVICES_DIGEST="$(az acr repository show -n "$ACR" --image "ehf/services:${RELEASE_TAG}" --query digest -o tsv)"
-export UI_DIGEST="$(az acr repository show -n "$ACR" --image "ehf/control-ui:${RELEASE_TAG}" --query digest -o tsv)"
+pin() { az acr repository show -n "$ACR" --image "ehf/$1:${RELEASE_TAG}" --query digest -o tsv; }
 
-export SERVICES_IMAGE="${ACR_LOGIN_SERVER}/ehf/services@${SERVICES_DIGEST}"
-export UI_IMAGE="${ACR_LOGIN_SERVER}/ehf/control-ui@${UI_DIGEST}"
+export MIGRATE_IMAGE="${ACR_LOGIN_SERVER}/ehf/migrate@$(pin migrate)"
+export CONTROL_API_IMAGE="${ACR_LOGIN_SERVER}/ehf/control-api@$(pin control-api)"
+export CASE_API_IMAGE="${ACR_LOGIN_SERVER}/ehf/case-api@$(pin case-api)"
+export GATEWAY_IMAGE="${ACR_LOGIN_SERVER}/ehf/gateway@$(pin gateway)"
+export RUNTIME_HOST_IMAGE="${ACR_LOGIN_SERVER}/ehf/runtime-host@$(pin runtime-host)"
+export DISPATCHER_IMAGE="${ACR_LOGIN_SERVER}/ehf/dispatcher@$(pin dispatcher)"
+export UI_IMAGE="${ACR_LOGIN_SERVER}/ehf/control-ui@$(pin control-ui)"
 
-echo "SERVICES_IMAGE=$SERVICES_IMAGE"
-echo "UI_IMAGE=$UI_IMAGE"
+for v in MIGRATE_IMAGE CONTROL_API_IMAGE CASE_API_IMAGE GATEWAY_IMAGE \
+         RUNTIME_HOST_IMAGE DISPATCHER_IMAGE UI_IMAGE; do
+  printf '%-20s %s\n' "$v" "${!v}"
+done
 ```
 
-Every app and job below references `@sha256:…`, never `:latest` and never the tag. Tags move; digests do not, and the release manifest in step 11.4 records exactly these values.
+Every app and job below references `@sha256:…`, never `:latest` and never the
+tag. Tags move; digests do not, and the release manifest records exactly these
+values.
 
 ---
 
@@ -666,7 +703,7 @@ az containerapp job create -g "$RG" -n "$JOB_MIGRATE" --environment "$CAE" \
   --trigger-type Manual \
   --replica-timeout 1800 --replica-retry-limit 1 \
   --replica-completion-count 1 --parallelism 1 \
-  --image "$SERVICES_IMAGE" \
+  --image "$MIGRATE_IMAGE" \
   --cpu 1 --memory 2Gi \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$MI_MIGRATE_ID" \
   --mi-user-assigned "$MI_MIGRATE_ID" \
@@ -678,11 +715,11 @@ az containerapp job create -g "$RG" -n "$JOB_MIGRATE" --environment "$CAE" \
     "CASE_LEDGER_SCHEMA=case_ledger" \
     "EVIDENCE_SCHEMA=evidence" \
   --command "/bin/sh" \
-  --args "-c" "pnpm db:migrate" \
+  --args "-c" "./packages/persistence/node_modules/.bin/tsx packages/persistence/src/migrate.ts && ./packages/case-store/node_modules/.bin/tsx packages/case-store/src/migrate.ts" \
   --tags $TAGS
 ```
 
-`pnpm db:migrate` runs `@ehf/persistence` then `@ehf/case-store` migrations, in that order — the same command Compose runs.
+The command runs the `@ehf/persistence` migrations then the `@ehf/case-store` migrations, in that order — the same two entrypoints Compose runs, invoked directly rather than through pnpm.
 
 ### 7.2 Execute it and confirm success
 
@@ -761,7 +798,7 @@ Holds the execution-envelope secret and the optional model credential. No other 
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_GATEWAY" --environment "$CAE" \
-  --image "$SERVICES_IMAGE" \
+  --image "$GATEWAY_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$MI_GATEWAY_ID" \
   --user-assigned "$MI_GATEWAY_ID" \
   --ingress internal --target-port 4101 --transport auto \
@@ -777,7 +814,7 @@ az containerapp create -g "$RG" -n "$APP_GATEWAY" --environment "$CAE" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
     $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
-  --command "/bin/sh" --args "-c" "pnpm --filter @ehf/capability-gateway start" \
+  --command "./apps/capability-gateway/node_modules/.bin/tsx" --args "apps/capability-gateway/src/server.ts" \
   --tags $TAGS
 ```
 
@@ -798,7 +835,7 @@ Without it the gateway reports `runtimeMode: Recorded` and serves the determinis
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_CASE_API" --environment "$CAE" \
-  --image "$SERVICES_IMAGE" \
+  --image "$CASE_API_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$MI_CASE_API_ID" \
   --user-assigned "$MI_CASE_API_ID" \
   --ingress internal --target-port 4102 --transport auto \
@@ -816,7 +853,7 @@ az containerapp create -g "$RG" -n "$APP_CASE_API" --environment "$CAE" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
     $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
-  --command "/bin/sh" --args "-c" "pnpm --filter @ehf/case-api start" \
+  --command "./apps/case-api/node_modules/.bin/tsx" --args "apps/case-api/src/server.ts" \
   --tags $TAGS
 ```
 
@@ -831,7 +868,7 @@ the runtime.
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_CONTROL_API" --environment "$CAE" \
-  --image "$SERVICES_IMAGE" \
+  --image "$CONTROL_API_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$MI_CONTROL_API_ID" \
   --user-assigned "$MI_CONTROL_API_ID" \
   --ingress internal --target-port 4100 --transport auto \
@@ -847,7 +884,7 @@ az containerapp create -g "$RG" -n "$APP_CONTROL_API" --environment "$CAE" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
     $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
-  --command "/bin/sh" --args "-c" "pnpm --filter @ehf/control-api start" \
+  --command "./apps/control-api/node_modules/.bin/tsx" --args "apps/control-api/src/server.ts" \
   --tags $TAGS
 ```
 
@@ -860,7 +897,7 @@ database handle is the LangGraph checkpoint store.
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_RUNTIME_HOST" --environment "$CAE" \
-  --image "$SERVICES_IMAGE" \
+  --image "$RUNTIME_HOST_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$MI_RUNTIME_HOST_ID" \
   --user-assigned "$MI_RUNTIME_HOST_ID" \
   --ingress internal --target-port 8088 --transport auto \
@@ -879,11 +916,11 @@ az containerapp create -g "$RG" -n "$APP_RUNTIME_HOST" --environment "$CAE" \
     "CAPABILITY_GATEWAY_URL=${URL_GATEWAY}" \
     "CASE_API_URL=${URL_CASE_API}" \
     $COMMON_OTEL \
-  --command "/bin/sh" --args "-c" "./node_modules/.bin/tsx apps/runtime-host/src/server.ts" \
+  --command "./apps/runtime-host/node_modules/.bin/tsx" --args "apps/runtime-host/src/server.ts" \
   --tags $TAGS
 ```
 
-The command invokes the checked-in `tsx` binary directly, matching the Compose definition, so the container never asks pnpm to relink the workspace at startup.
+The command invokes the service's own checked-in `tsx` binary, matching the Compose definition, so the non-root container never asks pnpm to relink the workspace at startup.
 
 To remove the runtime's last database credential entirely, set
 `RUNTIME_CHECKPOINT_BACKEND=memory` and drop the `database-url` secret and
@@ -898,7 +935,7 @@ No ingress. It owns leases and fencing, so it must never scale to zero — nothi
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_DISPATCHER" --environment "$CAE" \
-  --image "$SERVICES_IMAGE" \
+  --image "$DISPATCHER_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$MI_DISPATCHER_ID" \
   --user-assigned "$MI_DISPATCHER_ID" \
   --min-replicas 1 --max-replicas 1 --cpu 1 --memory 2Gi \
@@ -912,13 +949,14 @@ az containerapp create -g "$RG" -n "$APP_DISPATCHER" --environment "$CAE" \
     "RUNTIME_LOCAL_ENDPOINT=${URL_RUNTIME_HOST}/invocations" \
     "RUNTIME_HOST_AUTH_TOKEN=secretref:runtime-token" \
     "WORKER_LEASE_SECONDS=60" \
+    "WORKER_CONCURRENCY=2" \
     "WORKER_POLL_MS=1000" \
     "WORKER_RETRY_BASE_MS=2000" \
     "WORKER_RETRY_MAX_MS=60000" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
-  --command "/bin/sh" --args "-c" "pnpm --filter @ehf/runtime-worker start" \
+  --command "./apps/runtime-worker/node_modules/.bin/tsx" --args "apps/runtime-worker/src/worker.ts" \
   --tags $TAGS
 ```
 
@@ -965,6 +1003,8 @@ az containerapp create -g "$RG" -n "$APP_UI" --environment "$CAE" \
     "CONTROL_UI_ACTOR_ROLES=Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer" \
     "CONTROL_UI_APPROVER_ID=local-approver" \
     "CONTROL_UI_APPROVER_ROLES=Harness.Reader,Harness.Approver" \
+    "CONTROL_UI_LOCAL_AUTOLOGIN=true" \
+    "CONTROL_UI_LOCAL_AUTOMATED_APPROVAL=true" \
     "CONTROL_UI_VERSION=0.1.0" \
     "RUNTIME_PROVIDER=local_http" \
     "BUILD_COMMIT_SHA=${SOURCE_REVISION}" \
@@ -1185,25 +1225,23 @@ ContainerAppConsoleLogs_CL
 
 ### 11.2 Roll out a new release
 
+Rebuild, re-pin, migrate, then roll:
+
 ```bash
 export RELEASE_TAG="$(git rev-parse --short HEAD)"
-az acr build --registry "$ACR" --platform linux/amd64 --image "ehf/services:${RELEASE_TAG}" --file Dockerfile .
-az acr build --registry "$ACR" --platform linux/amd64 --image "ehf/control-ui:${RELEASE_TAG}" --file Dockerfile.ui .
-
-export SERVICES_DIGEST="$(az acr repository show -n "$ACR" --image "ehf/services:${RELEASE_TAG}" --query digest -o tsv)"
-export UI_DIGEST="$(az acr repository show -n "$ACR" --image "ehf/control-ui:${RELEASE_TAG}" --query digest -o tsv)"
-export SERVICES_IMAGE="${ACR_LOGIN_SERVER}/ehf/services@${SERVICES_DIGEST}"
-export UI_IMAGE="${ACR_LOGIN_SERVER}/ehf/control-ui@${UI_DIGEST}"
+# Re-run the build_service and pin blocks from part 5.
 
 # Schema first, if the release changes migrations.
-az containerapp job update -g "$RG" -n "$JOB_MIGRATE" --image "$SERVICES_IMAGE"
-az containerapp job start -g "$RG" -n "$JOB_MIGRATE"
+az containerapp job update -g "$RG" -n "$JOB_MIGRATE" --image "$MIGRATE_IMAGE"
+az containerapp job start -g "$RG" -n "$JOB_MIGRATE"   # wait for Succeeded
 
-# Then each service.
-for app in "$APP_GATEWAY" "$APP_CASE_API" "$APP_CONTROL_API" "$APP_RUNTIME_HOST" "$APP_DISPATCHER"; do
-  az containerapp update -g "$RG" -n "$app" --image "$SERVICES_IMAGE"
-done
-az containerapp update -g "$RG" -n "$APP_UI" --image "$UI_IMAGE"
+# Then each service, on its own image.
+az containerapp update -g "$RG" -n "$APP_GATEWAY"      --image "$GATEWAY_IMAGE"
+az containerapp update -g "$RG" -n "$APP_CASE_API"     --image "$CASE_API_IMAGE"
+az containerapp update -g "$RG" -n "$APP_CONTROL_API"  --image "$CONTROL_API_IMAGE"
+az containerapp update -g "$RG" -n "$APP_RUNTIME_HOST" --image "$RUNTIME_HOST_IMAGE"
+az containerapp update -g "$RG" -n "$APP_DISPATCHER"   --image "$DISPATCHER_IMAGE"
+az containerapp update -g "$RG" -n "$APP_UI"           --image "$UI_IMAGE"
 ```
 
 ### 11.3 Roll back
@@ -1228,13 +1266,15 @@ cat > "release-${RELEASE_TAG}.json" <<JSON
   "sourceRevision": "${SOURCE_REVISION}",
   "resourceGroup": "${RG}",
   "serviceImages": {
-    "control-api": "${SERVICES_IMAGE}",
-    "case-api": "${SERVICES_IMAGE}",
-    "capability-gateway": "${SERVICES_IMAGE}",
-    "runtime-host": "${SERVICES_IMAGE}",
-    "runtime-dispatcher": "${SERVICES_IMAGE}",
+    "migrate": "${MIGRATE_IMAGE}",
+    "control-api": "${CONTROL_API_IMAGE}",
+    "case-api": "${CASE_API_IMAGE}",
+    "capability-gateway": "${GATEWAY_IMAGE}",
+    "runtime-host": "${RUNTIME_HOST_IMAGE}",
+    "runtime-dispatcher": "${DISPATCHER_IMAGE}",
     "control-ui": "${UI_IMAGE}"
   },
+  "platformMode": "local",
   "runtimeProvider": "local_http",
   "foundryAgent": null,
   "migrationJob": "${JOB_MIGRATE}",
@@ -1360,7 +1400,7 @@ Everything created in the resource group, after a complete run:
 | Resource group | `rg-hf-poc-eastus2-01` | Stamp boundary; delete to remove everything |
 | Virtual network | `vnet-hf-poc-…` | `snet-apps` (/23, delegated to `Microsoft.App/environments`), `snet-postgres` (/26) |
 | Private DNS zone | `<pg>.private.postgres.database.azure.com` | Database name resolution inside the VNet |
-| Container registry | `cr hf poc …` | `ehf/services`, `ehf/control-ui` |
+| Container registry | `cr hf poc …` | `ehf/migrate`, `ehf/control-api`, `ehf/case-api`, `ehf/gateway`, `ehf/runtime-host`, `ehf/dispatcher`, `ehf/control-ui` |
 | Log Analytics workspace | `log-hf-poc-…` | Container logs |
 | Application Insights | `appi-hf-poc-…` | Platform telemetry from the managed OTel agent |
 | Key Vault | `kv-hf-poc-…` | `database-url`, `execution-envelope-secret`, `runtime-host-token`, `pg-admin-password`, `entra-client-secret`, optional `openrouter-api-key` |

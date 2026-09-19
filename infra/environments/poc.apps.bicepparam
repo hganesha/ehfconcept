@@ -6,7 +6,8 @@
 //
 //   CONTAINER_APPS_ENVIRONMENT_NAME, REGISTRY_LOGIN_SERVER, KEY_VAULT_URI
 //     -> outputs of the foundation deployment
-//   SERVICES_IMAGE, UI_IMAGE
+//   MIGRATE_IMAGE, CONTROL_API_IMAGE, CASE_API_IMAGE, GATEWAY_IMAGE,
+//   RUNTIME_HOST_IMAGE, DISPATCHER_IMAGE, UI_IMAGE
 //     -> digests from build-images.yml; a tag is rejected by the workflow
 //   MIGRATION_ONLY
 //     -> true for the first pass, which updates the migration job alone
@@ -34,7 +35,13 @@ param tags = {
 param containerAppsEnvironmentName = readEnvironmentVariable('CONTAINER_APPS_ENVIRONMENT_NAME', '')
 param registryLoginServer = readEnvironmentVariable('REGISTRY_LOGIN_SERVER', '')
 param keyVaultUri = readEnvironmentVariable('KEY_VAULT_URI', '')
-param servicesImage = readEnvironmentVariable('SERVICES_IMAGE', '')
+// One image per service: the Dockerfile prunes the workspace with SERVICE_FILTER.
+param migrateImage = readEnvironmentVariable('MIGRATE_IMAGE', '')
+param controlApiImage = readEnvironmentVariable('CONTROL_API_IMAGE', '')
+param caseApiImage = readEnvironmentVariable('CASE_API_IMAGE', '')
+param gatewayImage = readEnvironmentVariable('GATEWAY_IMAGE', '')
+param runtimeHostImage = readEnvironmentVariable('RUNTIME_HOST_IMAGE', '')
+param dispatcherImage = readEnvironmentVariable('DISPATCHER_IMAGE', '')
 param uiImage = readEnvironmentVariable('UI_IMAGE', '')
 param sourceRevision = readEnvironmentVariable('SOURCE_REVISION', '')
 
