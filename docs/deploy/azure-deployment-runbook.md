@@ -78,25 +78,40 @@ deployment configures the result:
 
 ### 0.3 Why this stamp runs in `local` platform mode
 
-The services now refuse to boot in a half-configured state. `PLATFORM_MODE=azure`
-asserts, per service, that:
+The services refuse to boot in a half-configured state. `PLATFORM_MODE=azure`
+asserts, per service, that every local-mode credential is **absent**
+(`EDGE_SERVICE_TOKEN`, `RUNTIME_SERVICE_TOKEN`, `RUNTIME_GRANT_SECRET`,
+`EXECUTION_ENVELOPE_SECRET`, `RUNTIME_HOST_AUTH_TOKEN`,
+`RUNTIME_CHECKPOINT_DATABASE_URL`), that no database URL carries a password or
+points at a local host, and that the Azure-mode replacements are **present**:
 
-- `EDGE_SERVICE_TOKEN`, `RUNTIME_SERVICE_TOKEN`, `RUNTIME_GRANT_SECRET`,
-  `EXECUTION_ENVELOPE_SECRET`, `RUNTIME_HOST_AUTH_TOKEN`, and
-  `RUNTIME_CHECKPOINT_DATABASE_URL` are **absent** — managed-identity Entra
-  tokens are meant to replace them;
-- `ENTRA_TENANT_ID`, `ENTRA_API_AUDIENCE`, and `PLATFORM_TENANT_ID` are present;
-- no database URL carries a password or points at a local host.
+| Requirement | Purpose |
+| --- | --- |
+| `ENTRA_TENANT_ID`, `ENTRA_API_AUDIENCE`, `PLATFORM_TENANT_ID` | validate inbound Entra tokens and bind the platform tenant |
+| `EXECUTION_ENVELOPE_PRIVATE_KEY_PEM`, `RUNTIME_GRANT_PUBLIC_KEY_PEM` | asymmetric envelope signing and grant verification, replacing the shared HS256 secret |
+| `INTERNAL_API_TOKEN_SCOPE` | the scope the runtime requests a managed-identity token for |
 
-Those invariants cannot all be satisfied today, because passwordless PostgreSQL
-is still `AZ-005`: a connection string without a password simply fails to
-authenticate. So this stamp deploys with `PLATFORM_MODE=local`, which is a
-deliberate, stated choice rather than an oversight — and the startup invariants
-are the reason you cannot quietly pretend otherwise. When `AZ-005` and the Entra
-workload tokens land, flip `platformMode` in `infra/environments/poc.apps.bicepparam`
-and the services will tell you, loudly, about anything still missing.
+The code supports all of this: `packages/persistence` passes a managed-identity
+token as the PostgreSQL password on every new pooled connection, the runtime
+acquires Entra tokens with `DefaultAzureCredential`, and services resolve callers
+through `EntraJwtPrincipalResolver` with an `Edge.Delegate` role gating any
+asserted end-user context.
 
-Deploy this as a **synthetic-data showcase**. Do not put real customer data in it, and do not present it as the regulated production design. Section 14 of the migration plan lists the production gates.
+**This runbook still deploys `local` mode**, and that is a scope choice rather
+than a limitation of the code. Azure mode additionally needs work that lives in
+the Entra directory and in PostgreSQL, not in a template:
+
+- an app registration per protected internal API, with the app roles
+  (`Edge.Delegate`, `Capability.Invoke`, and the rest) assigned to each service's
+  managed identity — Graph operations, not ARM;
+- a PostgreSQL Entra principal per managed identity, each granted only its own
+  schemas, created by connecting to the database as the Entra administrator;
+- an RSA keypair generated, stored, and rotated for envelope signing.
+
+Part 14 sketches that path. Until you work through it, `local` mode is what this
+stamp deploys — stated plainly, and enforced by the services rather than assumed.
+Flip `platformMode` in `infra/environments/poc.apps.bicepparam` when you are
+ready, and the startup invariants will name anything still missing.
 
 ### 0.4 Prerequisites
 
@@ -1379,9 +1394,9 @@ What it does **not** prove, and must not be claimed:
 | Claim to avoid | Why | Closes with |
 | --- | --- | --- |
 | "The signed-in user's identity drives authorization" | In `local` identity mode the control surface presents configured principals, not the Entra user from the token | `entra` identity provider, `AZ-003`, `AZ-004` |
-| "Passwordless database access" | Services authenticate with an administrator password from Key Vault; `packages/persistence` has no managed-identity path | `AZ-005` |
-| "Per-identity database privileges" | All services share one database principal | `AZ-005` |
-| "Hardware-backed execution signing" | Envelopes are brokered by the control plane but still signed with a shared HS256 secret | `AZ-006` |
+| "Passwordless database access" | The code supports it (`AZ-005` is implemented), but this stamp deploys an administrator password from Key Vault because it runs `local` mode | flip to azure mode, section 0.3 |
+| "Per-identity database privileges" | All services share one database principal; per-identity Entra principals are created in PostgreSQL, not in a template | azure mode, section 0.3 |
+| "Hardware-backed execution signing" | Azure mode signs envelopes with an RSA key supplied as PEM; it is asymmetric, but not a Key Vault-managed key, and this stamp uses the shared HS256 secret | `AZ-006` remainder |
 | "Workload-to-workload calls use Entra tokens" | Services authenticate to each other with shared tokens from Key Vault | `AZ-002` azure mode |
 | "This is Azure platform mode" | The stamp runs `PLATFORM_MODE=local`; azure mode's invariants cannot be satisfied until the above land, and the services enforce that | `AZ-005`, `AZ-006` |
 | "The runtime holds no data credential" | `RUNTIME_CHECKPOINT_BACKEND=postgres` keeps one checkpoint handle; `memory` removes it at the cost of resumability | `AZ-010` remainder |
