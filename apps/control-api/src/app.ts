@@ -1,5 +1,5 @@
 import Fastify from "fastify";
-import { runRequestSchema, verifyPlanDigest } from "@ehf/contracts";
+import { runRequestSchema } from "@ehf/contracts";
 import {
   admitPlan, createAuthoringDraft, createDatabase, createRun, getAuthoringDraft, getPlan, getRun,
   getAuthoringAgent, listAuthoringAgents, listAuthoringSkills, registerAuthoringAgent, registerAuthoringSkill,
@@ -34,8 +34,8 @@ export function buildControlApi(options: { db?: Database } = {}) {
   });
   app.post("/v1/plans", async (request, reply) => {
     try {
+      // admitPlan verifies the digest before it writes; do not re-order these.
       const admitted = await admitPlan(db, request.body);
-      if (!verifyPlanDigest(admitted.plan)) return reply.code(400).send({ error: "plan.digest_invalid" });
       return reply.code(admitted.created ? 201 : 200).send(admitted);
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : "plan.invalid" });
@@ -180,6 +180,7 @@ export function buildControlApi(options: { db?: Database } = {}) {
         workflowSource: draft.workflowSource,
         agents: registeredAgents.filter((item) => item.agent.status === "active").map((item) => item.agent),
         skills: registeredSkills.filter((item) => item.skill.status === "active").map((item) => item.skill),
+        capabilities: registry.filter((item) => item.capability.status === "active").map((item) => item.capability),
       });
       if (sources.materialized) {
         const analysis = analyzeAuthoringSources(sources.packageSource, sources.workflowSource);

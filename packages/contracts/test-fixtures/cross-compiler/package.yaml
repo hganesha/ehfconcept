@@ -1,0 +1,30 @@
+# Fixture package for the cross-compiler canonicalization test. The node config keys
+# below are deliberately mixed-case and underscore-bearing: they are the keys whose
+# ordering differs between a locale-sensitive sort and UTF-8 byte order, so a plan
+# compiled by harnessc only re-verifies in TypeScript when both canonicalizations agree.
+apiVersion: harness.factory/domain-package-v1
+kind: DomainPackage
+metadata:
+  name: cross-compiler-ordering
+  version: 0.1.0
+  domain: conformance
+  objective: Pin canonical key ordering across the Rust and TypeScript digest paths.
+workflow: workflow.yaml
+budgets:
+  maxDurationMs: 60000
+  maxCostUsd: 0.05
+  maxModelCalls: 0
+  maxCapabilityCalls: 1
+modelProfiles: []
+capabilities:
+  - id: vendor.lookup
+    kind: tool
+    effect: read
+    adapterBindingId: simulator:vendor.lookup
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    timeoutMs: 5000
+    maxAttempts: 1
+    idempotent: true
+bindings:
+  lookup: vendor.lookup

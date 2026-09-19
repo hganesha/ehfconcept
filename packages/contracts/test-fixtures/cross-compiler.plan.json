@@ -1,0 +1,249 @@
+{
+  "agents": [],
+  "apiVersion": "harness.factory/plan-v1",
+  "budgets": {
+    "maxCapabilityCalls": 1,
+    "maxCostUsd": 0.05,
+    "maxDurationMs": 60000,
+    "maxModelCalls": 0
+  },
+  "capabilities": [
+    {
+      "adapterBindingId": "simulator:vendor.lookup",
+      "effect": "read",
+      "id": "vendor.lookup",
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object"
+      },
+      "kind": "tool",
+      "maxAttempts": 1,
+      "outputSchema": {
+        "type": "object"
+      },
+      "timeoutMs": 5000
+    }
+  ],
+  "compiler": {
+    "lgirCoreRevision": "fec01bf0fa5ff259c071439d63ad71c9979668f9",
+    "name": "harnessc",
+    "version": "0.1.0"
+  },
+  "dependencyManifest": [
+    {
+      "digest": "632c3d6dfb0b41fab1bb28f2665393163f48a0c9df169ccae87ee54b80b6cda5",
+      "path": "package.yaml"
+    },
+    {
+      "digest": "e6974d8575f195f6ebb8f84f3092496b8c5e5b211db4c128434128b46ecfcdbc",
+      "path": "workflow.yaml"
+    }
+  ],
+  "execution": {
+    "durability": "sync",
+    "engine": {
+      "adapterVersion": "harness-langgraph-v1",
+      "kind": "langgraph-js",
+      "profile": "poc-v1"
+    },
+    "maxConcurrency": 1,
+    "maxTransitions": 200
+  },
+  "graph": {
+    "apiVersion": "ladder.dev/v1alpha1",
+    "edges": [
+      {
+        "condition": "",
+        "from": "intake",
+        "id": "e1",
+        "kind": "data",
+        "sourcePath": "",
+        "targetPath": "",
+        "to": "lookup"
+      },
+      {
+        "condition": "",
+        "from": "lookup",
+        "id": "e2",
+        "kind": "data",
+        "sourcePath": "",
+        "targetPath": "",
+        "to": "result"
+      }
+    ],
+    "name": "cross-compiler-ordering",
+    "nodeOrder": [
+      "intake",
+      "lookup",
+      "result"
+    ],
+    "nodes": [
+      {
+        "config": {
+          "aggregation": "",
+          "body": [],
+          "branches": [],
+          "carry": {},
+          "defaultBranch": "",
+          "entry": "",
+          "execution": "",
+          "exit": "",
+          "exitCondition": "",
+          "exitNode": "",
+          "expression": "",
+          "feedbackMode": "",
+          "join": "",
+          "maxIterations": 0,
+          "members": [],
+          "onExhausted": "",
+          "operation": "",
+          "router": "",
+          "subgraph": null,
+          "teacherModel": "",
+          "threshold": null,
+          "workingDirectory": ""
+        },
+        "id": "intake",
+        "inputSchema": null,
+        "kind": "input",
+        "name": "Intake",
+        "outputSchema": null,
+        "prompt": "",
+        "summary": ""
+      },
+      {
+        "config": {
+          "aggregation": "",
+          "body": [],
+          "branches": [],
+          "capabilityId": "vendor.lookup",
+          "carry": {},
+          "defaultBranch": "",
+          "entry": "",
+          "execution": "",
+          "exit": "",
+          "exitCondition": "",
+          "exitNode": "",
+          "expression": "",
+          "feedbackMode": "",
+          "join": "",
+          "maxIterations": 0,
+          "members": [],
+          "onExhausted": "",
+          "operation": "",
+          "router": "",
+          "subgraph": null,
+          "teacherModel": "",
+          "threshold": null,
+          "workingDirectory": ""
+        },
+        "id": "lookup",
+        "inputSchema": null,
+        "kind": "tool",
+        "name": "Vendor lookup",
+        "outputSchema": null,
+        "prompt": "",
+        "summary": ""
+      },
+      {
+        "config": {
+          "aggregation": "",
+          "body": [],
+          "branches": [],
+          "carry": {},
+          "defaultBranch": "",
+          "entry": "",
+          "execution": "",
+          "exit": "",
+          "exitCondition": "",
+          "exitNode": "",
+          "expression": "",
+          "feedbackMode": "",
+          "join": "",
+          "maxIterations": 0,
+          "members": [],
+          "onExhausted": "",
+          "operation": "",
+          "router": "",
+          "subgraph": null,
+          "teacherModel": "",
+          "threshold": null,
+          "workingDirectory": ""
+        },
+        "id": "result",
+        "inputSchema": null,
+        "kind": "output",
+        "name": "Result",
+        "outputSchema": null,
+        "prompt": "",
+        "summary": ""
+      }
+    ]
+  },
+  "kind": "HarnessPlan",
+  "metadata": {
+    "domain": "conformance",
+    "name": "cross-compiler-ordering",
+    "objective": "Pin canonical key ordering across the Rust and TypeScript digest paths.",
+    "version": "0.1.0"
+  },
+  "modelProfiles": [],
+  "packageDigest": "e5c71e3f837f4de334e5109848b919f744ff0fcdf53b6eb63aab2e85889f815b",
+  "permissionEnvelopes": [
+    {
+      "capabilities": [
+        "vendor.lookup"
+      ],
+      "digest": "f9aa306ef8e40533e6d720d659411c5e53969fd736e31752e012a5fe4733c098",
+      "effects": [
+        "read"
+      ],
+      "nodeId": "lookup"
+    }
+  ],
+  "planDigest": "e51e7cf2c757986c1a55350172f0eb60865f15d98c0aed3ebbfc9d64d4f2c56b",
+  "planId": "cross-compiler-ordering@0.1.0:e51e7cf2c757",
+  "schemas": {
+    "input": {
+      "properties": {
+        "VendorId": {
+          "type": "string"
+        },
+        "Zebra": {
+          "type": "string"
+        },
+        "apple": {
+          "type": "string"
+        },
+        "taxId": {
+          "type": "string"
+        },
+        "tax_id": {
+          "type": "string"
+        },
+        "vendorName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "vendorName"
+      ],
+      "type": "object"
+    },
+    "output": {
+      "properties": {
+        "Disposition": {
+          "type": "string"
+        },
+        "dispositionCode": {
+          "type": "string"
+        },
+        "disposition_code": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "skills": []
+}

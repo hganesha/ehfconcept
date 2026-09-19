@@ -1,0 +1,33 @@
+apiVersion: ladder.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: cross-compiler-ordering
+  title: Cross compiler ordering
+  description: Canonical ordering conformance fixture.
+  version: 0.1.0
+spec:
+  objective: Exercise canonical key ordering with adversarial schema property names.
+  inputs:
+    type: object
+    required: [vendorName]
+    properties:
+      vendorName: { type: string }
+      VendorId: { type: string }
+      tax_id: { type: string }
+      taxId: { type: string }
+      Zebra: { type: string }
+      apple: { type: string }
+  outputs:
+    type: object
+    properties:
+      Disposition: { type: string }
+      disposition_code: { type: string }
+      dispositionCode: { type: string }
+  policies: { maxConcurrency: 1, onFailure: stop, requireApprovalFor: [] }
+  nodes:
+    - { id: intake, kind: input, name: Intake }
+    - { id: lookup, kind: tool, name: Vendor lookup }
+    - { id: result, kind: output, name: Result }
+  edges:
+    - { id: e1, from: intake, to: lookup, kind: data }
+    - { id: e2, from: lookup, to: result, kind: data }

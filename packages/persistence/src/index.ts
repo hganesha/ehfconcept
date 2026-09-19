@@ -6,6 +6,7 @@ import {
   evaluationReportSchema,
   harnessPlanSchema,
   stableDigest,
+  verifyPlanDigest,
   skillRegistrationSchema,
   type AgentRegistration,
   type AuthoringStatus,
@@ -86,6 +87,12 @@ const runColumns = `run_id, idempotency_key, plan_digest, status, terminal_outco
 
 export async function admitPlan(db: Database, input: unknown): Promise<{ created: boolean; plan: HarnessPlan }> {
   const plan = harnessPlanSchema.parse(input);
+  // Admission is the only gate between an arbitrary document and something the
+  // dispatcher will execute and the gateway will treat as authority. Recompute the
+  // digest before the insert: a plan whose content does not hash to its claimed
+  // digest must never reach the table, because every later check -- permission
+  // envelopes, capability resolution, case-command authority -- keys off that digest.
+  if (!verifyPlanDigest(plan)) throw new Error("plan.digest_invalid");
   const result = await db.query(`
     insert into harness_control.plans(plan_digest, plan_id, name, domain, version, plan)
     values ($1, $2, $3, $4, $5, $6::jsonb)

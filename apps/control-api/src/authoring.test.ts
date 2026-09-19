@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { verifyPlanDigest } from "@ehf/contracts";
 import { analyzeAuthoringSources, compileAuthoringDraft, evaluateCompiledPlan } from "./authoring.js";
+import { resetCompilerBinaryCache } from "./harnessc.js";
 
 describe("authoring compiler", () => {
   it("compiles the checked-in KYC domain into the runtime plan contract", async () => {
@@ -25,6 +27,42 @@ describe("authoring compiler", () => {
       result.plan?.graph.nodes.find((node) => node.id === "decision-agent")?.config.caseWrites,
     ).toHaveLength(3);
     expect(result.plan && evaluateCompiledPlan(result.plan).passed).toBe(true);
+  });
+
+  it("emits plans through the pinned compiler of record", async () => {
+    const packageSource = await readFile(new URL("../../../domains/kyc/package.yaml", import.meta.url), "utf8");
+    const workflowSource = await readFile(new URL("../../../domains/kyc/workflow.yaml", import.meta.url), "utf8");
+    const result = await compileAuthoringDraft({
+      packageSource,
+      workflowSource,
+      registryCapabilities: [],
+      modelProfilesPath: new URL("../../../config/model-profiles.json", import.meta.url).pathname,
+    });
+    // The author plane used to build plans in TypeScript while stamping them with an
+    // lgir-core revision it never executed. The revision recorded in a plan must come
+    // from the binary that actually validated the workflow.
+    expect(result.plan?.compiler.name).toBe("harnessc");
+    expect(result.plan && verifyPlanDigest(result.plan)).toBe(true);
+    expect(result.diagnostics.some((item) => item.code === "compiler.plan_emitted")).toBe(true);
+  });
+
+  it("fails closed when the compiler binary is unavailable", async () => {
+    const packageSource = await readFile(new URL("../../../domains/kyc/package.yaml", import.meta.url), "utf8");
+    const workflowSource = await readFile(new URL("../../../domains/kyc/workflow.yaml", import.meta.url), "utf8");
+    resetCompilerBinaryCache();
+    try {
+      const result = await compileAuthoringDraft({
+        packageSource,
+        workflowSource,
+        registryCapabilities: [],
+        modelProfilesPath: new URL("../../../config/model-profiles.json", import.meta.url).pathname,
+        env: { HARNESSC_PATH: "/nonexistent/harnessc", PATH: "/nonexistent" },
+      });
+      expect(result.plan).toBeNull();
+      expect(result.diagnostics.map((item) => item.code)).toContain("compiler.binary_missing");
+    } finally {
+      resetCompilerBinaryCache();
+    }
   });
 
   it("rejects cyclic graphs and invalid case-write commands", () => {

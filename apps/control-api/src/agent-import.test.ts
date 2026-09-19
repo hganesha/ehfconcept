@@ -91,7 +91,7 @@ describe("agent authoring", () => {
       { id: "e2", from: "review", to: "result", kind: "data" },
     ];
     const materialized = materializeRegisteredContracts({
-      packageSource: sources.packageSource, workflowSource: JSON.stringify(workflow), agents: [bundle.agent], skills: bundle.skills,
+      packageSource: sources.packageSource, workflowSource: JSON.stringify(workflow), agents: [bundle.agent], skills: bundle.skills, capabilities: [],
     });
     const pkg = parse(materialized.packageSource);
     const node = parse(materialized.workflowSource).spec.nodes.find((candidate: { id: string }) => candidate.id === "review");
