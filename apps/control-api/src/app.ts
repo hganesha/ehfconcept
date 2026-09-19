@@ -5,6 +5,7 @@ import {
   createGuard,
   createWorkloadResolverFromEnv,
   DelegatedPrincipalResolver,
+  isAzureMode,
   type AuthorizationDecision,
   type PlatformAction,
   type Principal,
@@ -91,12 +92,16 @@ export function buildControlApi(options: ControlApiOptions = {}) {
   ): Promise<Principal> => guard.require(request, action, resource);
   const profilesPath = env.MODEL_PROFILES_PATH ?? "config/model-profiles.json";
   const envelopeSecret = () => {
-    const value = options.envelopeSecret ?? env.EXECUTION_ENVELOPE_SECRET;
+    const value = options.envelopeSecret ?? (isAzureMode(env)
+      ? env.EXECUTION_ENVELOPE_PRIVATE_KEY_PEM
+      : env.EXECUTION_ENVELOPE_SECRET);
     if (!value) throw new EnvelopeBrokerError("broker.envelope_secret_missing", 503);
     return value;
   };
   const grantSecret = () => {
-    const value = options.grantSecret ?? env.RUNTIME_GRANT_SECRET;
+    const value = options.grantSecret ?? (isAzureMode(env)
+      ? env.RUNTIME_GRANT_PUBLIC_KEY_PEM
+      : env.RUNTIME_GRANT_SECRET);
     if (!value) throw new EnvelopeBrokerError("broker.grant_secret_missing", 503);
     return value;
   };
@@ -396,11 +401,18 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     if (!await getPlan(db, parsed.data.planDigest, principal.tenantId)) return reply.code(404).send({ error: "plan.not_found" });
     const key = String(request.headers["idempotency-key"] ?? "");
     if (!key) return reply.code(400).send({ error: "run.idempotency_key_required" });
-    const result = await createRun(db, {
-      planDigest: parsed.data.planDigest, runInput: parsed.data.input, idempotencyKey: key,
-      tenantId: principal.tenantId,
-    });
-    return reply.code(result.created ? 202 : 200).send(result);
+    try {
+      const result = await createRun(db, {
+        planDigest: parsed.data.planDigest, runInput: parsed.data.input, idempotencyKey: key,
+        tenantId: principal.tenantId,
+      });
+      return reply.code(result.created ? 202 : 200).send(result);
+    } catch (error) {
+      if (error instanceof Error && error.message === "run.idempotency_conflict") {
+        return reply.code(409).send({ error: error.message });
+      }
+      throw error;
+    }
   });
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId", async (request, reply) => {
     const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
@@ -436,9 +448,10 @@ export function buildControlApi(options: ControlApiOptions = {}) {
       viewerUrl: base ? `${base}/trace/${run.traceId}` : null,
     };
   });
-  app.get<{ Params: { runId: string }; Querystring: { after?: string } }>("/v1/runs/:runId/events", async (request) => {
-    await requirePrincipal(request, "event.read", { kind: "run", id: request.params.runId });
-    return { events: await listEvents(db, request.params.runId, Number(request.query.after ?? 0)) };
+  app.get<{ Params: { runId: string }; Querystring: { after?: string } }>("/v1/runs/:runId/events", async (request, reply) => {
+    const principal = await requirePrincipal(request, "event.read", { kind: "run", id: request.params.runId });
+    if (!await getRun(db, request.params.runId, principal.tenantId)) return reply.code(404).send({ error: "run.not_found" });
+    return { events: await listEvents(db, request.params.runId, principal.tenantId, Number(request.query.after ?? 0)) };
   });
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId/attempts", async (request, reply) => {
     const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
@@ -446,14 +459,14 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     return { attempts: await listNodeAttempts(db, request.params.runId) };
   });
   app.get<{ Querystring: { runId?: string; decision?: string; limit?: string } }>("/v1/gateway/receipts", async (request, reply) => {
-    await requirePrincipal(request, "receipt.read", { kind: "receipt" });
+    const principal = await requirePrincipal(request, "receipt.read", { kind: "receipt" });
     const decision = request.query.decision;
     if (decision && decision !== "allowed" && decision !== "denied") {
       return reply.code(400).send({ error: "gateway.decision_filter_invalid" });
     }
     const normalizedDecision = decision === "allowed" || decision === "denied" ? decision : undefined;
     return {
-      receipts: await listGatewayReceipts(db, {
+      receipts: await listGatewayReceipts(db, principal.tenantId, {
         ...(request.query.runId ? { runId: request.query.runId } : {}),
         ...(normalizedDecision ? { decision: normalizedDecision } : {}),
         ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),

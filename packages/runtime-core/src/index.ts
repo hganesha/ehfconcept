@@ -7,7 +7,7 @@ import {
   type HarnessPlan,
   type CapabilityResult,
 } from "@ehf/contracts";
-import type { FencedRun, RuntimeStateStore } from "@ehf/runtime-state";
+import type { FencedRun, RuntimeStateStore, WorkloadCredential } from "@ehf/runtime-state";
 import {
   SpanKind,
   injectTraceContext,
@@ -40,8 +40,12 @@ export type RuntimeContext = {
    * different question than the execution envelope, which says what this run, node and
    * attempt may do; both are required at the gateway.
    */
-  serviceToken: string;
+  serviceToken: WorkloadCredential;
 };
+
+async function workloadToken(credential: WorkloadCredential): Promise<string> {
+  return typeof credential === "string" ? credential : credential();
+}
 
 type IssuedEnvelope = { envelope: string; expiresInSeconds: number; caseWrites: string[] };
 
@@ -56,8 +60,9 @@ async function requestExecutionEnvelope(
   nodeId: string,
   invocationId: string,
 ): Promise<IssuedEnvelope> {
+  const token = await workloadToken(context.serviceToken);
   const headers: Record<string, string> = {
-    authorization: `Bearer ${context.serviceToken}`,
+    authorization: `Bearer ${token}`,
     "x-runtime-grant": context.executionGrant,
     "content-type": "application/json",
   };
@@ -272,8 +277,9 @@ async function caseRequest(
       "harness.plan.digest_prefix": context.plan.planDigest.slice(0, 12),
     },
   }, async (span) => {
+    const token = await workloadToken(context.serviceToken);
     const headers: Record<string, string> = {
-      authorization: `Bearer ${context.serviceToken}`,
+      authorization: `Bearer ${token}`,
       "content-type": "application/json",
       ...(init.headers as Record<string, string> ?? {}),
     };

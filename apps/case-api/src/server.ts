@@ -5,8 +5,8 @@ import { initializeTelemetry } from "@ehf/telemetry";
 import { buildCaseApi } from "./app.js";
 
 assertPlatformInvariants({
-  forbidden: ["EDGE_SERVICE_TOKEN", "RUNTIME_SERVICE_TOKEN"],
-  required: ["ENTRA_TENANT_ID", "ENTRA_API_AUDIENCE", "PLATFORM_TENANT_ID"],
+  forbidden: ["EDGE_SERVICE_TOKEN", "RUNTIME_SERVICE_TOKEN", "EXECUTION_ENVELOPE_SECRET"],
+  required: ["ENTRA_TENANT_ID", "ENTRA_API_AUDIENCE", "PLATFORM_TENANT_ID", "EXECUTION_ENVELOPE_PUBLIC_KEY_PEM"],
   databaseUrls: ["DATABASE_URL", "CASE_DATABASE_URL"],
 });
 

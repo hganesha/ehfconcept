@@ -143,7 +143,11 @@ export async function invokeModel(input: ModelInvocation): Promise<AdapterResult
   });
   if (input.outputSchema) {
     const result = await generateObject({
-      model: provider(input.profile.model),
+      // Domain packages accept general JSON Schema. OpenAI-compatible strict
+      // mode rejects otherwise valid schemas unless every object is fully
+      // closed and all properties are required, so let OpenRouter route the
+      // schema in non-strict mode while the SDK still parses object output.
+      model: provider(input.profile.model, { structuredOutputs: { strict: false } }),
       schema: jsonSchema(input.outputSchema),
       prompt: promptFor(input.input),
       maxOutputTokens: input.profile.maxOutputTokens,

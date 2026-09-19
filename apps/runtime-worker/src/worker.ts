@@ -15,6 +15,7 @@ import {
   scheduleRunRetry,
 } from "@ehf/persistence";
 import { mintRuntimeGrant } from "@ehf/execution-auth";
+import { assertPlatformInvariants, isAzureMode } from "@ehf/identity";
 import { createRuntimeProviderFromEnv } from "@ehf/runtime-provider";
 import {
   SpanKind,
@@ -28,6 +29,12 @@ import {
 
 const telemetry = initializeTelemetry({ serviceName: "harness-runtime-dispatcher" });
 
+assertPlatformInvariants({
+  forbidden: ["RUNTIME_GRANT_SECRET"],
+  required: ["RUNTIME_GRANT_PRIVATE_KEY_PEM"],
+  databaseUrls: ["DATABASE_URL"],
+});
+
 function requiredEnv(name: string, error: string): string {
   const value = process.env[name];
   if (!value) throw new Error(error);
@@ -37,9 +44,12 @@ function requiredEnv(name: string, error: string): string {
 const connectionString = requiredEnv("DATABASE_URL", "database.url_missing");
 // The dispatcher owns the lease and the fence, so it is the only component that may
 // issue authority for an invocation. The runtime receives a grant, never a signing key.
-const grantSecret = requiredEnv("RUNTIME_GRANT_SECRET", "runtime.grant_secret_missing");
+const grantSecret = isAzureMode()
+  ? requiredEnv("RUNTIME_GRANT_PRIVATE_KEY_PEM", "runtime.grant_private_key_missing")
+  : requiredEnv("RUNTIME_GRANT_SECRET", "runtime.grant_secret_missing");
 const db = createDatabase(connectionString);
 const workerId = process.env.WORKER_ID ?? `${hostname()}:${process.pid}`;
+const workerConcurrency = Number(process.env.WORKER_CONCURRENCY ?? 1);
 const leaseSeconds = Number(process.env.WORKER_LEASE_SECONDS ?? 60);
 const pollMs = Number(process.env.WORKER_POLL_MS ?? 750);
 const retryBaseMs = Number(process.env.WORKER_RETRY_BASE_MS ?? 2_000);
@@ -63,8 +73,8 @@ function backoffMs(attempt: number): number {
 
 
 
-async function workOnce(): Promise<boolean> {
-  const run = await claimRun(db, workerId, leaseSeconds);
+async function workOnce(slotWorkerId: string): Promise<boolean> {
+  const run = await claimRun(db, slotWorkerId, leaseSeconds);
   if (!run) return false;
   const claimedRun = run;
   const plan = await getPlan(db, run.planDigest);
@@ -100,7 +110,7 @@ async function workOnce(): Promise<boolean> {
     await bindRunTrace(db, {
       runId: run.runId,
       attempt: run.attempt,
-      workerId,
+      workerId: slotWorkerId,
       fencingEpoch: run.fencingEpoch,
       traceId: root.traceId,
       spanId: root.spanId,
@@ -114,7 +124,7 @@ async function workOnce(): Promise<boolean> {
       nodeId: null,
       status: "observed",
       values: {
-        workerId,
+        workerId: slotWorkerId,
         fencingEpoch: run.fencingEpoch,
         traceId: root.traceId,
         runtimeProvider: provider.kind,
@@ -127,7 +137,7 @@ async function workOnce(): Promise<boolean> {
     const leaseLost = new AbortController();
     const cancelled = new AbortController();
     const heartbeat = setInterval(() => {
-      void renewLease(db, run.runId, workerId, run.fencingEpoch, leaseSeconds).then((held) => {
+      void renewLease(db, run.runId, slotWorkerId, run.fencingEpoch, leaseSeconds).then((held) => {
         if (!held && !leaseLost.signal.aborted) leaseLost.abort(new Error("runtime.lease_lost"));
       }).catch(() => { /* a failed renewal is retried on the next beat */ });
       // Requesting a cancellation moves the fence, so the renewal above fails too. The
@@ -144,7 +154,7 @@ async function workOnce(): Promise<boolean> {
         grantId: invocationId,
         runId: run.runId,
         attempt: run.attempt,
-        workerId,
+        workerId: slotWorkerId,
         planDigest: run.planDigest,
         fencingEpoch: run.fencingEpoch,
         // Outlives the invocation deadline by a small margin and no more.
@@ -155,7 +165,7 @@ async function workOnce(): Promise<boolean> {
         invocationId,
         runId: claimedRun.runId,
         attempt: run.attempt,
-        workerId,
+        workerId: slotWorkerId,
         leaseId: `${run.runId}:${run.attempt}:${run.fencingEpoch}`,
         fencingEpoch: claimedRun.fencingEpoch,
         deadlineAt: new Date(Date.now() + plan.budgets.maxDurationMs).toISOString(),
@@ -180,7 +190,7 @@ async function workOnce(): Promise<boolean> {
       if (result.status === "completed") {
         await completeRun(db, {
           runId: run.runId,
-          workerId,
+          workerId: slotWorkerId,
           fencingEpoch: run.fencingEpoch,
           status: "completed",
           terminalOutcome: "completed",
@@ -243,7 +253,7 @@ async function workOnce(): Promise<boolean> {
       // budget is spent or the fence has moved, and the failure becomes terminal.
       if (!denied && retryable(code)) {
         const scheduled = await scheduleRunRetry(db, {
-          runId: claimedRun.runId, workerId, fencingEpoch: claimedRun.fencingEpoch,
+          runId: claimedRun.runId, workerId: slotWorkerId, fencingEpoch: claimedRun.fencingEpoch,
           errorCode: code, backoffMs: backoffMs(claimedRun.attempt),
         });
         if (scheduled) {
@@ -271,7 +281,7 @@ async function workOnce(): Promise<boolean> {
       }
       await completeRun(db, {
         runId: claimedRun.runId,
-        workerId,
+        workerId: slotWorkerId,
         fencingEpoch: claimedRun.fencingEpoch,
         status: denied ? "denied" : "failed",
         terminalOutcome: denied ? "denied" : "failed",
@@ -290,6 +300,10 @@ async function workOnce(): Promise<boolean> {
   }, parent);
 }
 
+if (!Number.isInteger(workerConcurrency) || workerConcurrency < 1 || workerConcurrency > 64) {
+  throw new Error("runtime.worker_concurrency_invalid");
+}
+
 let stopping = false;
 process.on("SIGTERM", () => { stopping = true; });
 process.on("SIGINT", () => { stopping = true; });
@@ -298,20 +312,26 @@ process.on("SIGINT", () => { stopping = true; });
 // unadmitted plan or one transport error turned into a container restart loop. The loop
 // absorbs failures; the claimed run is released by lease expiry and retried under the
 // normal attempt budget.
-while (!stopping) {
-  let worked = false;
-  try {
-    worked = await workOnce();
-  } catch (error) {
-    process.stderr.write(`dispatcher.iteration_failed ${error instanceof Error ? error.message : "unknown"}\n`);
-  }
-  if (!worked) {
+async function runSlot(slot: number): Promise<void> {
+  const slotWorkerId = `${workerId}:${slot}`;
+  while (!stopping) {
+    let worked = false;
     try {
-      await failExhaustedRuns(db);
-      await finalizeAbandonedCancellations(db);
-    } catch { /* the sweep retries on the next idle poll */ }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+      worked = await workOnce(slotWorkerId);
+    } catch (error) {
+      process.stderr.write(`dispatcher.iteration_failed ${error instanceof Error ? error.message : "unknown"}\n`);
+    }
+    if (!worked) {
+      if (slot === 0) {
+        try {
+          await failExhaustedRuns(db);
+          await finalizeAbandonedCancellations(db);
+        } catch { /* the sweep retries on the next idle poll */ }
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
   }
 }
+await Promise.all(Array.from({ length: workerConcurrency }, (_, slot) => runSlot(slot)));
 await db.end();
 await telemetry.shutdown();

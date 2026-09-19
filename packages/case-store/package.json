@@ -15,8 +15,10 @@
   },
   "dependencies": {
     "@ehf/contracts": "workspace:*",
+    "@ehf/identity": "workspace:*",
     "pg": "8.23.0",
-    "zod": "4.6.5"
+    "zod": "4.6.5",
+    "tsx": "4.23.1"
   },
   "devDependencies": {
     "@types/pg": "8.16.0"

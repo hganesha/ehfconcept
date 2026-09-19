@@ -1,4 +1,4 @@
-import { SignJWT, jwtVerify } from "jose";
+import { SignJWT, importPKCS8, importSPKI, jwtVerify } from "jose";
 import {
   executionEnvelopeClaimsSchema,
   runtimeGrantClaimsSchema,
@@ -18,6 +18,16 @@ function key(secret: string): Uint8Array {
   return new TextEncoder().encode(secret);
 }
 
+async function signingMaterial(value: string) {
+  if (value.includes("BEGIN PRIVATE KEY")) return { algorithm: "RS256" as const, key: await importPKCS8(value, "RS256") };
+  return { algorithm: "HS256" as const, key: key(value) };
+}
+
+async function verificationMaterial(value: string) {
+  if (value.includes("BEGIN PUBLIC KEY")) return { algorithms: ["RS256"] as const, key: await importSPKI(value, "RS256") };
+  return { algorithms: ["HS256"] as const, key: key(value) };
+}
+
 export type MintEnvelopeInput = {
   secret: string;
   invocationId: string;
@@ -35,6 +45,7 @@ export type MintEnvelopeInput = {
 
 export async function mintExecutionEnvelope(input: MintEnvelopeInput): Promise<string> {
   const ttl = Math.min(120, Math.max(5, input.ttlSeconds ?? 60));
+  const material = await signingMaterial(input.secret);
   return new SignJWT({
     run_id: input.runId,
     node_id: input.nodeId,
@@ -46,20 +57,21 @@ export async function mintExecutionEnvelope(input: MintEnvelopeInput): Promise<s
     case_writes: input.caseWrites ?? [],
     fencing_epoch: input.fencingEpoch,
   })
-    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setProtectedHeader({ alg: material.algorithm, typ: "JWT" })
     .setIssuer(ISSUER)
     .setAudience(AUDIENCE)
     .setJti(input.invocationId)
     .setIssuedAt()
     .setExpirationTime(`${ttl}s`)
-    .sign(key(input.secret));
+    .sign(material.key);
 }
 
 export async function verifyExecutionEnvelope(token: string, secret: string): Promise<ExecutionEnvelopeClaims> {
-  const verified = await jwtVerify(token, key(secret), {
+  const material = await verificationMaterial(secret);
+  const verified = await jwtVerify(token, material.key, {
     issuer: ISSUER,
     audience: AUDIENCE,
-    algorithms: ["HS256"],
+    algorithms: [...material.algorithms],
     clockTolerance: 2,
   });
   return executionEnvelopeClaimsSchema.parse(verified.payload);
@@ -88,6 +100,7 @@ export async function mintRuntimeGrant(input: MintRuntimeGrantInput): Promise<st
   // Long enough to cover the invocation deadline, since the runtime needs it for the
   // whole run, and bounded so a leaked grant expires with the work it was issued for.
   const ttl = Math.min(3_600, Math.max(30, input.ttlSeconds));
+  const material = await signingMaterial(input.secret);
   return new SignJWT({
     run_id: input.runId,
     attempt: input.attempt,
@@ -95,20 +108,21 @@ export async function mintRuntimeGrant(input: MintRuntimeGrantInput): Promise<st
     plan_digest: input.planDigest,
     fencing_epoch: input.fencingEpoch,
   })
-    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setProtectedHeader({ alg: material.algorithm, typ: "JWT" })
     .setIssuer(GRANT_ISSUER)
     .setAudience(GRANT_AUDIENCE)
     .setJti(input.grantId)
     .setIssuedAt()
     .setExpirationTime(`${ttl}s`)
-    .sign(key(input.secret));
+    .sign(material.key);
 }
 
 export async function verifyRuntimeGrant(token: string, secret: string): Promise<RuntimeGrantClaims> {
-  const verified = await jwtVerify(token, key(secret), {
+  const material = await verificationMaterial(secret);
+  const verified = await jwtVerify(token, material.key, {
     issuer: GRANT_ISSUER,
     audience: GRANT_AUDIENCE,
-    algorithms: ["HS256"],
+    algorithms: [...material.algorithms],
     clockTolerance: 2,
   });
   return runtimeGrantClaimsSchema.parse(verified.payload);

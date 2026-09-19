@@ -17,6 +17,8 @@ RUN --mount=type=cache,id=ehf-cargo-registry,target=/usr/local/cargo/registry \
 
 FROM node:24-bookworm-slim
 WORKDIR /app
+ARG SERVICE_FILTER=@ehf/control-api...
+ARG SERVICE_FILTER_2=
 RUN npm install --global pnpm@11.9.0
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps ./apps
@@ -25,7 +27,13 @@ COPY config ./config
 COPY domains ./domains
 RUN --mount=type=cache,id=ehf-pnpm-store,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
-    pnpm install --frozen-lockfile --config.minimum-release-age=0 --network-concurrency=4 --fetch-retries=5 --fetch-timeout=120000
+    if [ -n "$SERVICE_FILTER_2" ]; then \
+      pnpm --filter "$SERVICE_FILTER" --filter "$SERVICE_FILTER_2" install --prod --frozen-lockfile --config.minimum-release-age=0 --network-concurrency=4 --fetch-retries=5 --fetch-timeout=120000; \
+    else \
+      pnpm --filter "$SERVICE_FILTER" install --prod --frozen-lockfile --config.minimum-release-age=0 --network-concurrency=4 --fetch-retries=5 --fetch-timeout=120000; \
+    fi
 COPY --from=compiler /usr/local/bin/harnessc /usr/local/bin/harnessc
+RUN groupadd --system --gid 1001 ehf && useradd --system --uid 1001 --gid ehf --home-dir /nonexistent ehf
 ENV HARNESSC_PATH=/usr/local/bin/harnessc
 ENV NODE_ENV=production
+USER ehf

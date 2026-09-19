@@ -17,5 +17,7 @@ ENV PORT=4200
 ENV HOSTNAME=0.0.0.0
 COPY --from=builder /app/apps/control-ui/.next/standalone /app/
 COPY --from=builder /app/apps/control-ui/.next/static ./.next/static
+RUN groupadd --system --gid 1001 ehf && useradd --system --uid 1001 --gid ehf --home-dir /nonexistent ehf
+USER ehf
 EXPOSE 4200
 CMD ["node", "server.js"]

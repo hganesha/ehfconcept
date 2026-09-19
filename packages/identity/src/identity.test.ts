@@ -5,7 +5,9 @@ import {
   assertPlatformInvariants,
   connectionStringHasPassword,
   createAuthorizer,
+  createAzureAccessTokenProvider,
   createPrincipalResolverFromEnv,
+  createPostgresAccessTokenProvider,
   evaluate,
   LocalHeaderPrincipalResolver,
   PlatformConfigError,
@@ -108,5 +110,30 @@ describe("platform invariants", () => {
     expect(connectionStringHasPassword("postgresql://app:secret@host:5432/db")).toBe(true);
     expect(connectionStringHasPassword("host=db.postgres.database.azure.com;Password=secret")).toBe(true);
     expect(connectionStringHasPassword("postgresql://app@host:5432/db")).toBe(false);
+  });
+});
+
+describe("managed-identity database authentication", () => {
+  it("requests a fresh PostgreSQL access token for each connection", async () => {
+    let calls = 0;
+    const password = createPostgresAccessTokenProvider({
+      getToken: async (scope: string | string[]) => {
+        calls += 1;
+        expect(scope).toBe("https://ossrdbms-aad.database.windows.net/.default");
+        return { token: `token-${calls}`, expiresOnTimestamp: Date.now() + 60_000 };
+      },
+    });
+    await expect(password()).resolves.toBe("token-1");
+    await expect(password()).resolves.toBe("token-2");
+  });
+
+  it("requests internal API tokens for the configured audience", async () => {
+    const token = createAzureAccessTokenProvider("api://ehf-internal/.default", {
+      getToken: async (scope: string | string[]) => {
+        expect(scope).toBe("api://ehf-internal/.default");
+        return { token: "managed-token", expiresOnTimestamp: Date.now() + 60_000 };
+      },
+    });
+    await expect(token()).resolves.toBe("managed-token");
   });
 });

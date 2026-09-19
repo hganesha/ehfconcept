@@ -1,5 +1,11 @@
+import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { mintExecutionEnvelope, verifyExecutionEnvelope } from "./index.js";
+import {
+  mintExecutionEnvelope,
+  mintRuntimeGrant,
+  verifyExecutionEnvelope,
+  verifyRuntimeGrant,
+} from "./index.js";
 
 const secret = "a-local-test-secret-that-is-long-enough";
 
@@ -41,5 +47,47 @@ describe("execution envelope", () => {
       fencingEpoch: 1,
     });
     await expect(verifyExecutionEnvelope(token, "another-secret-that-is-long-enough")).rejects.toThrow();
+  });
+
+  it("uses asymmetric keys for cloud execution envelopes and runtime grants", async () => {
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    const envelope = await mintExecutionEnvelope({
+      secret: privateKey,
+      invocationId: "inv-rsa",
+      runId: "run-rsa",
+      nodeId: "screen",
+      attempt: 1,
+      planDigest: "a".repeat(64),
+      permissionDigest: "b".repeat(64),
+      capabilities: ["screening.sanctions.search"],
+      effects: ["read"],
+      fencingEpoch: 4,
+    });
+    await expect(verifyExecutionEnvelope(envelope, publicKey)).resolves.toMatchObject({
+      jti: "inv-rsa",
+      run_id: "run-rsa",
+      fencing_epoch: 4,
+    });
+
+    const grant = await mintRuntimeGrant({
+      secret: privateKey,
+      grantId: "grant-rsa",
+      runId: "run-rsa",
+      attempt: 1,
+      workerId: "worker-1",
+      planDigest: "a".repeat(64),
+      fencingEpoch: 4,
+      ttlSeconds: 60,
+    });
+    await expect(verifyRuntimeGrant(grant, publicKey)).resolves.toMatchObject({
+      jti: "grant-rsa",
+      worker_id: "worker-1",
+      fencing_epoch: 4,
+    });
+    await expect(verifyExecutionEnvelope(envelope, secret)).rejects.toThrow();
   });
 });

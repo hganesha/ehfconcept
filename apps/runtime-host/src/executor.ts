@@ -4,7 +4,7 @@ import {
   type RuntimeInvocationResult,
 } from "@ehf/contracts";
 import { lowerHarnessPlan } from "@ehf/runtime-langgraph";
-import { HttpRuntimeStateStore, type RuntimeStateStore } from "@ehf/runtime-state";
+import { HttpRuntimeStateStore, type RuntimeStateStore, type WorkloadCredential } from "@ehf/runtime-state";
 
 export type RuntimeExecutorDependencies = {
   /** Optional: absent when the deployment runs without a resumable checkpoint backend. */
@@ -12,7 +12,7 @@ export type RuntimeExecutorDependencies = {
   gatewayUrl: string;
   caseApiUrl?: string;
   controlPlaneUrl: string;
-  serviceToken: string;
+  serviceToken: WorkloadCredential;
   providerMetadata?: Record<string, string>;
   /** Overridable so contract tests can drive a Postgres-backed store directly. */
   createStateStore?: (grant: string) => RuntimeStateStore;

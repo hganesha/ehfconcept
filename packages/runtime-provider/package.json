@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@azure/identity": "4.13.0",
+    "@azure/identity": "4.13.3",
     "@ehf/contracts": "workspace:*",
     "@ehf/telemetry": "workspace:*"
   }

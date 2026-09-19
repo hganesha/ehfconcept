@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { qualify } from "./config.js";
 import type { CaseStore } from "./index.js";
 
@@ -50,6 +51,8 @@ export class LoggingOutboxSink implements OutboxSink {
 
 export type RelayOptions = {
   batchSize?: number;
+  /** A crashed relay's claim becomes eligible again after this interval. */
+  claimTimeoutMs?: number;
   /** Published rows older than this are removed; 0 keeps them indefinitely. */
   retentionDays?: number;
 };
@@ -69,29 +72,41 @@ export async function drainOutbox(
   options: RelayOptions = {},
 ): Promise<Drained> {
   const batchSize = Math.max(1, Math.min(500, options.batchSize ?? 100));
+  const claimTimeoutSeconds = Math.max(5, Math.ceil((options.claimTimeoutMs ?? 300_000) / 1000));
   const caseOutbox = qualify(store.schemas.ledger, "outbox");
   const evidenceOutbox = qualify(store.schemas.evidence, "outbox");
   let published = 0;
   for (const [source, table] of [["case", caseOutbox], ["evidence", evidenceOutbox]] as const) {
+    const claimId = randomUUID();
     const client = await store.db.connect();
+    let records: OutboxRecord[] = [];
     try {
       await client.query("begin");
       const claimed = await client.query<{
         outbox_id: string; tenant_id: string; case_id: string;
         event_type: string; classification: string; created_at: Date;
       }>(`
-        select outbox_id, tenant_id, case_id, event_type, classification, created_at
-        from ${table}
-        where published_at is null
-        order by created_at
-        for update skip locked
-        limit $1
-      `, [batchSize]);
+        with candidates as (
+          select outbox_id
+          from ${table}
+          where published_at is null
+            and (publish_claimed_at is null or publish_claimed_at < now() - make_interval(secs => $3))
+          order by created_at
+          for update skip locked
+          limit $1
+        )
+        update ${table} outbox
+        set publish_claim_id = $2, publish_claimed_at = now(), publish_attempts = publish_attempts + 1
+        from candidates
+        where outbox.outbox_id = candidates.outbox_id
+        returning outbox.outbox_id, outbox.tenant_id, outbox.case_id, outbox.event_type,
+                  outbox.classification, outbox.created_at
+      `, [batchSize, claimId, claimTimeoutSeconds]);
       if (!claimed.rows.length) {
         await client.query("commit");
         continue;
       }
-      const records: OutboxRecord[] = claimed.rows.map((row) => ({
+      records = claimed.rows.map((row) => ({
         outboxId: row.outbox_id,
         source,
         tenantId: row.tenant_id,
@@ -100,19 +115,30 @@ export async function drainOutbox(
         classification: row.classification,
         createdAt: row.created_at.toISOString(),
       }));
-      await sink.publish(records);
-      await client.query(`
-        update ${table}
-        set published_at = now(), publish_attempts = publish_attempts + 1
-        where outbox_id = any($1::text[])
-      `, [records.map((record) => record.outboxId)]);
       await client.query("commit");
-      published += records.length;
     } catch (error) {
       await client.query("rollback");
       throw error;
     } finally {
       client.release();
+    }
+    try {
+      // Publishing happens after the claim transaction commits. A slow or unavailable
+      // bus therefore cannot hold row locks or an open database transaction.
+      await sink.publish(records);
+      await store.db.query(`
+        update ${table}
+        set published_at = now(), publish_claim_id = null, publish_claimed_at = null
+        where publish_claim_id = $1 and outbox_id = any($2::text[])
+      `, [claimId, records.map((record) => record.outboxId)]);
+      published += records.length;
+    } catch (error) {
+      await store.db.query(`
+        update ${table}
+        set publish_claim_id = null, publish_claimed_at = null
+        where publish_claim_id = $1
+      `, [claimId]).catch(() => { /* the claim timeout recovers if release also fails */ });
+      throw error;
     }
   }
   const purged = options.retentionDays && options.retentionDays > 0

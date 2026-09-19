@@ -7,7 +7,7 @@ import { buildGateway } from "./app.js";
 // are an authentication bypass, and a degraded verifier is not a state to serve from.
 assertPlatformInvariants({
   forbidden: ["EXECUTION_ENVELOPE_SECRET", "RUNTIME_SERVICE_TOKEN", "EDGE_SERVICE_TOKEN"],
-  required: ["ENTRA_TENANT_ID", "ENTRA_API_AUDIENCE", "PLATFORM_TENANT_ID"],
+  required: ["ENTRA_TENANT_ID", "ENTRA_API_AUDIENCE", "PLATFORM_TENANT_ID", "EXECUTION_ENVELOPE_PUBLIC_KEY_PEM"],
   databaseUrls: ["DATABASE_URL"],
 });
 

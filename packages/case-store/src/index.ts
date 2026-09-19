@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import pg, { type PoolClient } from "pg";
 import { z } from "zod";
+import { createPostgresAccessTokenProvider, isAzureMode } from "@ehf/identity";
 import {
   stableDigest,
   type BusinessCommand,
@@ -46,8 +47,16 @@ export function createCaseStore(options: {
   if (artifactBackend !== "postgres") throw new Error(`case_store.artifact_backend_unsupported:${artifactBackend}`);
   if (!options.db && !connectionString) throw new Error("case_store.database_url_missing");
   if (!Number.isInteger(evidenceMaxBytes) || evidenceMaxBytes < 1) throw new Error("case_store.evidence_max_bytes_invalid");
+  const poolMax = Number(process.env.DB_POOL_MAX ?? 12);
+  if (!Number.isInteger(poolMax) || poolMax < 1 || poolMax > 100) throw new Error("database.pool_max_invalid");
   return {
-    db: options.db ?? new Pool({ connectionString, max: 12 }),
+    db: options.db ?? new Pool({
+      connectionString,
+      max: poolMax,
+      connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 5_000),
+      idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30_000),
+      ...(isAzureMode() ? { password: createPostgresAccessTokenProvider() } : {}),
+    }),
     schemas: options.schemas ?? caseStoreSchemas(),
     artifactBackend,
     evidenceRequireScan: process.env.CASE_EVIDENCE_REQUIRE_SCAN === "true",

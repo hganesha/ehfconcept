@@ -39,6 +39,20 @@ describe("http runtime state store", () => {
     expect(calls[0]?.body).toEqual({ run, nodeId: "lookup", inputDigest: "a".repeat(64) });
   });
 
+  it("refreshes a managed-identity token for every request", async () => {
+    const { calls, fetchImpl } = recordingFetch(new Response(null, { status: 204 }));
+    let issued = 0;
+    const subject = new HttpRuntimeStateStore({
+      baseUrl: "http://control",
+      serviceToken: async () => `managed-${++issued}`,
+      executionGrant: "grant-token",
+      fetchImpl,
+    });
+    await subject.nodeStarted(run, { nodeId: "a", inputDigest: "a".repeat(64) });
+    await subject.nodeStarted(run, { nodeId: "b", inputDigest: "b".repeat(64) });
+    expect(calls.map((call) => call.headers.authorization)).toEqual(["Bearer managed-1", "Bearer managed-2"]);
+  });
+
   it("surfaces a denial rather than continuing silently", async () => {
     // A runtime whose fence moved on must see its journal write refused, not assume it
     // landed and carry on producing effects.

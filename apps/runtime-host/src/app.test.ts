@@ -34,6 +34,18 @@ describe("runtime host", () => {
     await app.close();
   });
 
+  it("supports an asynchronous workload-identity verifier", async () => {
+    const app = buildRuntimeHost({
+      authorize: async (authorization) => authorization === "Bearer entra-token",
+      execute: async () => ({}),
+    });
+    expect((await app.inject({ method: "GET", url: "/invocations/INV-1" })).statusCode).toBe(401);
+    expect((await app.inject({
+      method: "GET", url: "/invocations/INV-1", headers: { authorization: "Bearer entra-token" },
+    })).statusCode).toBe(200);
+    await app.close();
+  });
+
   it("rejects malformed invocation before execution", async () => {
     let called = false;
     const app = buildRuntimeHost({ authToken: "secret", execute: async () => { called = true; } });
@@ -45,6 +57,31 @@ describe("runtime host", () => {
     });
     expect(response.statusCode).toBe(400);
     expect(called).toBe(false);
+    await app.close();
+  });
+
+  it("accepts and returns the Foundry message envelope", async () => {
+    const invocation = invocationPayload();
+    const app = buildRuntimeHost({
+      authToken: "secret",
+      execute: async () => ({
+        contractVersion: "runtime.result.v1",
+        invocationId: invocation.invocationId,
+        runId: invocation.runId,
+        status: "completed",
+        output: { ok: true },
+        errorCode: null,
+        checkpointId: null,
+        providerMetadata: { host: "azure_foundry" },
+      }),
+    });
+    const response = await app.inject({
+      method: "POST", url: "/invocations",
+      headers: { authorization: "Bearer secret" },
+      payload: { message: invocation },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().result).toMatchObject({ status: "completed", output: { ok: true } });
     await app.close();
   });
 });

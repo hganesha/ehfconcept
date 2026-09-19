@@ -4,11 +4,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 
 api="${CONTROL_API_URL:-http://127.0.0.1:4100}"
-plan="${1:-artifacts/plans/kyc.plan.json}"
+plan="${1:-artifacts/plans/invoice.plan.json}"
 if [[ $# -ge 2 ]]; then
   run_input="$2"
 else
-  run_input='{"name":"Ada Lovelace","country":"GB"}'
+  run_input='{"vendorName":"Analytical Engines Ltd","purchaseOrderId":"PO-1843","amount":1250}'
 fi
 
 admitted="$(curl --fail --silent --show-error "${edge_auth[@]}" -H 'content-type: application/json' --data-binary "@$plan" "$api/v1/plans")"
