@@ -1,5 +1,5 @@
 import { parse, stringify } from "yaml";
-import type { AgentRegistration, SkillRegistration } from "@ehf/contracts";
+import type { AgentRegistration, CapabilityRegistration, SkillRegistration } from "@ehf/contracts";
 
 type JsonMap = Record<string, unknown>;
 function object(value: unknown): value is JsonMap { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
@@ -11,6 +11,14 @@ function compiledSkill(skill: SkillRegistration): JsonMap {
 
 function compiledAgent(agent: AgentRegistration): JsonMap {
   const { source: _source, status: _status, ...contract } = agent;
+  return contract;
+}
+
+/// A registry capability becomes part of the package the compiler sees, so the plan
+/// embeds the exact capability contract it was compiled against rather than a name that
+/// the gateway registry could later redefine underneath an admitted plan.
+function compiledCapability(capability: CapabilityRegistration): JsonMap {
+  const { description: _description, owner: _owner, dataClasses: _classes, status: _status, ...contract } = capability;
   return contract;
 }
 
@@ -68,6 +76,7 @@ export function applyAgentToAuthoringSources(input: {
 
 export function materializeRegisteredContracts(input: {
   packageSource: string; workflowSource: string; agents: AgentRegistration[]; skills: SkillRegistration[];
+  capabilities: CapabilityRegistration[];
 }): { packageSource: string; workflowSource: string; materialized: boolean } {
   const pkg = parse(input.packageSource) as JsonMap;
   const workflow = parse(input.workflowSource) as JsonMap;
@@ -102,37 +111,60 @@ export function materializeRegisteredContracts(input: {
     const skill = registrySkills.get(skillId);
     return skill ? [skill] : [];
   });
-  if (!agents.length && !skills.length) return { packageSource: input.packageSource, workflowSource: input.workflowSource, materialized: false };
+  const contractsMaterialized = Boolean(agents.length || skills.length);
+  if (contractsMaterialized) materializeAgentContracts();
 
-  pkg.agents = upsertById(packageAgents, agents.map(compiledAgent));
-  pkg.skills = upsertById(packageSkills, skills.map(compiledSkill));
-  const modelProfiles = Array.isArray(pkg.modelProfiles) ? pkg.modelProfiles as unknown[] : [];
-  pkg.modelProfiles = [...new Set([...modelProfiles, ...agents.map((agent) => agent.modelProfileId)])];
-  const bindings = object(pkg.bindings) ? pkg.bindings : {};
-  for (const node of nodes) {
-    const config = object(node.config) ? node.config : {};
-    const agentRef = typeof config.agentRef === "string" ? config.agentRef : null;
-    const agent = agentRef ? agents.find((candidate) => candidate.id === agentRef) : undefined;
-    if (!agent) continue;
-    node.inputSchema = object(node.inputSchema) ? node.inputSchema : agent.inputSchema;
-    node.outputSchema = object(node.outputSchema) ? node.outputSchema : agent.outputSchema;
-    node.role = typeof node.role === "string" ? node.role : agent.role;
-    node.prompt = typeof node.prompt === "string" ? node.prompt : agent.prompt;
-    node.config = {
-      ...config,
-      caseWrites: Array.isArray(config.caseWrites) ? config.caseWrites : agent.caseWrites,
-      skillRefs: Array.isArray(config.skillRefs) ? config.skillRefs : agent.skillIds,
-      modelProfileId: typeof config.modelProfileId === "string" ? config.modelProfileId : agent.modelProfileId,
-      runtimeTarget: typeof config.runtimeTarget === "string" ? config.runtimeTarget : agent.runtimeTarget,
-    };
-    if (agent.primaryCapabilityId && typeof bindings[String(node.id)] !== "string") bindings[String(node.id)] = agent.primaryCapabilityId;
+  // Bindings are settled by now, so inline every bound capability the package does not
+  // already carry. The compiler only sees the package, and a plan that named a registry
+  // capability without embedding its contract could be re-pointed by a later registry
+  // edit without changing the plan digest.
+  const settledBindings = object(pkg.bindings) ? pkg.bindings : {};
+  const packageCapabilities = Array.isArray(pkg.capabilities) ? pkg.capabilities as JsonMap[] : [];
+  const embeddedCapabilityIds = new Set(packageCapabilities.map((capability) => capability.id).filter((id): id is string => typeof id === "string"));
+  const registryCapabilities = new Map(input.capabilities.map((capability) => [capability.id, capability]));
+  const missingCapabilities = [...new Set(Object.values(settledBindings).filter((id): id is string => typeof id === "string"))]
+    .filter((id) => !embeddedCapabilityIds.has(id))
+    .flatMap((id) => {
+      const capability = registryCapabilities.get(id);
+      return capability ? [capability] : [];
+    });
+  if (missingCapabilities.length) pkg.capabilities = upsertById(packageCapabilities, missingCapabilities.map(compiledCapability));
+
+  if (!contractsMaterialized && !missingCapabilities.length) {
+    return { packageSource: input.packageSource, workflowSource: input.workflowSource, materialized: false };
   }
-  pkg.bindings = bindings;
   return {
     packageSource: stringify(pkg, { lineWidth: 120 }),
     workflowSource: stringify(workflow, { lineWidth: 120 }),
     materialized: true,
   };
+
+  function materializeAgentContracts(): void {
+    pkg.agents = upsertById(packageAgents, agents.map(compiledAgent));
+    pkg.skills = upsertById(packageSkills, skills.map(compiledSkill));
+    const modelProfiles = Array.isArray(pkg.modelProfiles) ? pkg.modelProfiles as unknown[] : [];
+    pkg.modelProfiles = [...new Set([...modelProfiles, ...agents.map((agent) => agent.modelProfileId)])];
+    const bindings = object(pkg.bindings) ? pkg.bindings : {};
+    for (const node of nodes) {
+      const config = object(node.config) ? node.config : {};
+      const agentRef = typeof config.agentRef === "string" ? config.agentRef : null;
+      const agent = agentRef ? agents.find((candidate) => candidate.id === agentRef) : undefined;
+      if (!agent) continue;
+      node.inputSchema = object(node.inputSchema) ? node.inputSchema : agent.inputSchema;
+      node.outputSchema = object(node.outputSchema) ? node.outputSchema : agent.outputSchema;
+      node.role = typeof node.role === "string" ? node.role : agent.role;
+      node.prompt = typeof node.prompt === "string" ? node.prompt : agent.prompt;
+      node.config = {
+        ...config,
+        caseWrites: Array.isArray(config.caseWrites) ? config.caseWrites : agent.caseWrites,
+        skillRefs: Array.isArray(config.skillRefs) ? config.skillRefs : agent.skillIds,
+        modelProfileId: typeof config.modelProfileId === "string" ? config.modelProfileId : agent.modelProfileId,
+        runtimeTarget: typeof config.runtimeTarget === "string" ? config.runtimeTarget : agent.runtimeTarget,
+      };
+      if (agent.primaryCapabilityId && typeof bindings[String(node.id)] !== "string") bindings[String(node.id)] = agent.primaryCapabilityId;
+    }
+    pkg.bindings = bindings;
+  }
 }
 
 export function updateNodeCaseWrites(workflowSource: string, nodeId: string, caseWrites: unknown[]): string {

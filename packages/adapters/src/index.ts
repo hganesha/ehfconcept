@@ -47,6 +47,14 @@ export type ModelInvocation = {
   apiKey?: string;
   siteUrl?: string;
   appName?: string;
+  /**
+   * Whether an absent credential may be answered by the deterministic recorded adapter.
+   *
+   * The recorded adapter is what makes the POC runnable offline, but silently standing in
+   * for a real provider means a deployment can report model calls it never made. Callers
+   * that expect a real provider pass false and get a failure instead.
+   */
+  allowRecordedFallback?: boolean;
 };
 
 export type AdapterResult = {
@@ -124,7 +132,10 @@ function recordedModel(profile: ModelProfile, input: unknown): AdapterResult {
 }
 
 export async function invokeModel(input: ModelInvocation): Promise<AdapterResult> {
-  if (!input.apiKey) return recordedModel(input.profile, input.input);
+  if (!input.apiKey) {
+    if (input.allowRecordedFallback === false) throw new Error("adapter.model_credential_missing");
+    return recordedModel(input.profile, input.input);
+  }
   const provider = createOpenRouter({
     apiKey: input.apiKey,
     ...(input.siteUrl ? { headers: { "HTTP-Referer": input.siteUrl } } : {}),

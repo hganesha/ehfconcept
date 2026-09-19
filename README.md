@@ -10,23 +10,38 @@ This repository proves the core architecture as a local, Docker-runnable vertica
 - local HTTP and Azure Foundry runtime provider adapters; the provider binding is configuration-derived and recorded by digest
 - LangGraph.js plan adapter in the isolated host with Postgres checkpoints (`thread_id = runId`; the run ledger binds that globally unique run to its immutable plan digest)
 - Postgres run ledger, node attempts, events, leases, and fencing epochs
-- capability gateway with short-lived signed execution envelopes, plan/permission verification, budgets, and idempotent receipts
+- capability gateway requiring both a workload credential and a short-lived execution envelope, with plan/permission verification, transactionally reserved budgets, and idempotent receipts
+- an execution-envelope broker in the control plane: the dispatcher issues a run-scoped grant, the runtime exchanges it per node, and the broker re-reads the lease and fence before signing. The runtime holds no signing key.
+- identity and authorization across every service: a principal resolver (local headers for development, Entra JWT for Azure), an explicit role-to-action table, per-tenant scoping, separation of duties between author and approver, and bounded authorization decision records
 - OpenRouter model-profile tiers plus deterministic recorded mode when no API key is configured
 - simulator adapters for sanctions, vendor, and purchase-order lookups
 - control API for plan admission, run commands, run queries, and event queries
 - integrated Next.js control surface backed by the control API, capability gateway, and tenant-scoped case API; it includes scalable categorized harness/case graphs, node inspection, case activity history, and trace links
-- author plane for importing or creating domain sources, graph and node inspection, YAML editing, validation, deterministic compilation, evaluation, approval, publication, capability registration, and auditable lifecycle transitions
+- author plane for importing or creating domain sources, graph and node inspection, YAML editing, validation, evaluation, approval, publication, capability registration, and auditable lifecycle transitions. Plan emission is delegated to the pinned `harnessc` binary, which is the only compiler: the author plane resolves and validates the authoring surface and then shells out.
 - Docker Compose stack with Postgres, migration, API, gateway, and worker
 - end-to-end OpenTelemetry traces exported over OTLP to the local Jaeger UI
 - canonical KYC case store with configurable PostgreSQL schemas for current state, append-only ledger, and evidence
 - transactional BusinessCommands with sequence preconditions, semantic idempotency, hash-chained events, lineage, and outbox records
 - content-addressed local evidence artifacts behind a replaceable storage boundary
 
-The OpenRouter credential is present only in the capability-gateway container. Plans and workers carry a model profile ID, never an API key.
+The OpenRouter credential is present only in the capability-gateway container. Plans and workers carry a model profile ID, never an API key. Without a credential the gateway answers with the deterministic recorded adapter in local mode and fails closed in Azure mode, so a deployment cannot report model calls it did not make.
+
+### Trust boundaries
+
+| Component | Holds | Does not hold |
+| --- | --- | --- |
+| `runtime-dispatcher` | lease, fence, runtime-grant signing key | envelope signing key, provider credentials |
+| `control-api` | envelope signing key, run journal, plan admission | provider credentials |
+| `runtime-host` | a per-invocation grant it cannot mint | signing keys, run journal credentials, provider credentials |
+| `capability-gateway` | provider credentials, envelope verifier | plan authorship, case authority |
+| `case-api` | case, ledger and evidence stores, envelope verifier | signing keys, provider credentials |
+
+A runtime asks the control plane for authority per node and journals through it, so it needs no database credential of its own. Its remaining database handle is the LangGraph checkpoint store; `RUNTIME_CHECKPOINT_BACKEND=memory` removes that too, at the cost of resumability.
 
 ## Run it
 
-Requirements: Docker, Rust, Node 24+, pnpm 11+, `curl`, and `jq`.
+Requirements: Docker, Rust, Node 24+, pnpm 11+, `curl`, and `jq`. The image builds
+`harnessc` in a Rust stage, because the author plane cannot emit a plan without it.
 
 ```bash
 make check
@@ -59,11 +74,29 @@ The trace hierarchy follows the implementation standard: `harness.run` → `runt
 
 Verify an exported trace and its cross-service topology with `make trace RUN_ID=RUN-...`. The control API also exposes `GET /v1/runs/:runId/trace`, including a local Jaeger deep link.
 
+## Platform mode
+
+The same images run locally and in Azure; the difference is configuration. `PLATFORM_MODE=azure`
+switches the identity provider to Entra and makes the local-mode conveniences refusals rather
+than defaults: a header-trusting principal resolver cannot be constructed, static service tokens
+and shared signing secrets are rejected at startup, a password-bearing or local-host database URL
+is rejected, and the recorded model adapter no longer stands in for an absent provider credential.
+Services fail to boot rather than serving traffic half-configured.
+
+| Setting | Local | Azure |
+| --- | --- | --- |
+| `PLATFORM_MODE` | `local` | `azure` |
+| `IDENTITY_PROVIDER` | `local_headers` | `entra` |
+| `EDGE_SERVICE_TOKEN` / `RUNTIME_SERVICE_TOKEN` | shared tokens | rejected; managed-identity tokens |
+| `EXECUTION_ENVELOPE_SECRET` | HMAC, control plane and verifiers | rejected; asymmetric signing |
+| `MODEL_RECORDED_FALLBACK` | `allow` | `deny` |
+| `RUNTIME_CHECKPOINT_BACKEND` | `postgres` | `memory` until a remote checkpoint store exists |
+
 ## Stable boundaries for the cloud phase
 
 The transferable seams are the `HarnessPlan` contract, compiler output, runtime adapter interface, execution envelope, capability request/result receipts, event vocabulary, and Postgres persistence model. A cloud phase can replace the local queue polling, secret signer, and deployment substrate without changing domain packages or bypassing the gateway.
 
-The default local binding is `RUNTIME_PROVIDER=local_http`, with the dispatcher calling `runtime-host-local` over the internal Compose network. To select the implemented Foundry dispatcher adapter in an Azure deployment, set `RUNTIME_PROVIDER=azure_foundry`, `FOUNDRY_AGENT_INVOCATION_ENDPOINT`, `FOUNDRY_AGENT_NAME`, and immutable `FOUNDRY_AGENT_VERSION`; `DefaultAzureCredential` obtains the `https://ai.azure.com/.default` token. The Azure Hosted Agent still needs the documented Invocations-protocol wrapper and deployment/promotion steps before that path can be exercised. The local host currently retains a transitional `RUNTIME_CHECKPOINT_DATABASE_URL` for LangGraph checkpoint and node journaling only; removing that direct database dependency is the next isolation increment.
+The default local binding is `RUNTIME_PROVIDER=local_http`, with the dispatcher calling `runtime-host-local` over the internal Compose network. To select the implemented Foundry dispatcher adapter in an Azure deployment, set `RUNTIME_PROVIDER=azure_foundry`, `FOUNDRY_AGENT_INVOCATION_ENDPOINT`, `FOUNDRY_AGENT_NAME`, and immutable `FOUNDRY_AGENT_VERSION`; `DefaultAzureCredential` obtains the `https://ai.azure.com/.default` token. The Azure Hosted Agent still needs the documented Invocations-protocol wrapper and deployment/promotion steps before that path can be exercised. The local host no longer journals to PostgreSQL: run state, node attempts and durable events go through a private control-plane surface that re-checks the grant, the lease and the fence before recording anything. Its only remaining database handle is the LangGraph checkpoint store, selected by `RUNTIME_CHECKPOINT_BACKEND`; `memory` removes it entirely and makes the invocation non-resumable.
 
 To deploy this stack to Azure, follow [the Azure deployment runbook](docs/deploy/azure-deployment-runbook.md). It provisions a dedicated resource group step by step, starting with Entra and managed identities, and states plainly which identity, database, and runtime guarantees the current code does not yet provide.
 The same stamp is available as infrastructure as code in [`infra/`](infra/README.md) — Bicep templates deployed in four stages so that no secret is ever a template parameter — with OIDC-federated GitHub Actions workflows in [`.github/workflows/`](.github/workflows) that validate, build digest-pinned images, run migrations to completion, and only then roll the services.

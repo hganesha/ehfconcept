@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+
 run_id="${1:?usage: scripts/verify-trace.sh RUN-ID}"
 api="${CONTROL_API_URL:-http://127.0.0.1:4100}"
 jaeger="${JAEGER_API_URL:-http://127.0.0.1:16686}"
-trace_id="$(curl -fsS "$api/v1/runs/$run_id/trace" | jq -r '.traceId')"
+trace_id="$(curl -fsS "${edge_auth[@]}" "$api/v1/runs/$run_id/trace" | jq -r '.traceId')"
 
 trace_json=""
 for _ in $(seq 1 15); do

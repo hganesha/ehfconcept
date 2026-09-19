@@ -32,6 +32,9 @@ importers:
       '@ehf/execution-auth':
         specifier: workspace:*
         version: link:../../packages/execution-auth
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
@@ -53,6 +56,12 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/execution-auth':
+        specifier: workspace:*
+        version: link:../../packages/execution-auth
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/telemetry':
         specifier: workspace:*
         version: link:../../packages/telemetry
@@ -68,15 +77,27 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/execution-auth':
+        specifier: workspace:*
+        version: link:../../packages/execution-auth
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
+      '@ehf/runtime-state':
+        specifier: workspace:*
+        version: link:../../packages/runtime-state
       fastify:
         specifier: 5.12.5
         version: 5.12.5
       yaml:
         specifier: 2.9.1
         version: 2.9.1
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
 
   apps/control-ui:
     dependencies:
@@ -120,15 +141,24 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
-      '@ehf/persistence':
+      '@ehf/identity':
         specifier: workspace:*
-        version: link:../../packages/persistence
+        version: link:../../packages/identity
       '@ehf/runtime-langgraph':
         specifier: workspace:*
         version: link:../../packages/runtime-langgraph
+      '@ehf/runtime-state':
+        specifier: workspace:*
+        version: link:../../packages/runtime-state
       '@ehf/telemetry':
         specifier: workspace:*
         version: link:../../packages/telemetry
+      '@langchain/langgraph':
+        specifier: 1.4.15
+        version: 1.4.15(@langchain/core@1.2.11(@opentelemetry/api@1.9.1)(@opentelemetry/exporter-trace-otlp-proto@0.222.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-trace-base@2.11.0(@opentelemetry/api@1.9.1)))(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(zod@4.6.5)
+      '@langchain/langgraph-checkpoint':
+        specifier: 1.1.5
+        version: 1.1.5(@langchain/core@1.2.11(@opentelemetry/api@1.9.1)(@opentelemetry/exporter-trace-otlp-proto@0.222.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-trace-base@2.11.0(@opentelemetry/api@1.9.1)))
       '@langchain/langgraph-checkpoint-postgres':
         specifier: 1.0.5
         version: 1.0.5(@langchain/core@1.2.11(@opentelemetry/api@1.9.1)(@opentelemetry/exporter-trace-otlp-proto@0.222.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-trace-base@2.11.0(@opentelemetry/api@1.9.1)))(@langchain/langgraph-checkpoint@1.1.5(@langchain/core@1.2.11(@opentelemetry/api@1.9.1)(@opentelemetry/exporter-trace-otlp-proto@0.222.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-trace-base@2.11.0(@opentelemetry/api@1.9.1))))
@@ -141,6 +171,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/execution-auth':
+        specifier: workspace:*
+        version: link:../../packages/execution-auth
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
@@ -200,11 +233,20 @@ importers:
         specifier: 6.2.12
         version: 6.2.12
 
+  packages/identity:
+    dependencies:
+      jose:
+        specifier: 6.2.12
+        version: 6.2.12
+
   packages/persistence:
     dependencies:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@ehf/runtime-state':
+        specifier: workspace:*
+        version: link:../runtime-state
       pg:
         specifier: 8.23.0
         version: 8.23.0
@@ -221,9 +263,9 @@ importers:
       '@ehf/execution-auth':
         specifier: workspace:*
         version: link:../execution-auth
-      '@ehf/persistence':
+      '@ehf/runtime-state':
         specifier: workspace:*
-        version: link:../persistence
+        version: link:../runtime-state
       '@ehf/telemetry':
         specifier: workspace:*
         version: link:../telemetry
@@ -257,6 +299,18 @@ importers:
       '@ehf/telemetry':
         specifier: workspace:*
         version: link:../telemetry
+
+  packages/runtime-state:
+    dependencies:
+      '@ehf/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@ehf/telemetry':
+        specifier: workspace:*
+        version: link:../telemetry
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
 
   packages/telemetry:
     dependencies:

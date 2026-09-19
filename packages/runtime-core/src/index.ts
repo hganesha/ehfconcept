@@ -7,14 +7,7 @@ import {
   type HarnessPlan,
   type CapabilityResult,
 } from "@ehf/contracts";
-import { mintExecutionEnvelope } from "@ehf/execution-auth";
-import {
-  appendEvent,
-  beginNodeAttempt,
-  finishNodeAttempt,
-  updateRunNode,
-  type Database,
-} from "@ehf/persistence";
+import type { FencedRun, RuntimeStateStore } from "@ehf/runtime-state";
 import {
   SpanKind,
   injectTraceContext,
@@ -23,7 +16,11 @@ import {
 } from "@ehf/telemetry";
 
 export type RuntimeContext = {
-  db: Database;
+  /**
+   * Durable journal. The runtime describes what happened and the control plane decides
+   * whether to record it; the runtime holds no database credential of its own.
+   */
+  state: RuntimeStateStore;
   plan: HarnessPlan;
   runId: string;
   runAttempt: number;
@@ -31,8 +28,56 @@ export type RuntimeContext = {
   fencingEpoch: number;
   gatewayUrl: string;
   caseApiUrl?: string;
-  executionSecret: string;
+  /** Control-plane endpoint that exchanges the runtime grant for a node-scoped envelope. */
+  envelopeBrokerUrl: string;
+  /**
+   * Authority for this invocation, issued by the dispatcher. The runtime holds no signing
+   * key: it cannot mint an envelope, only ask for one and be refused.
+   */
+  executionGrant: string;
+  /**
+   * Credential proving which workload is calling the internal services. It answers a
+   * different question than the execution envelope, which says what this run, node and
+   * attempt may do; both are required at the gateway.
+   */
+  serviceToken: string;
 };
+
+type IssuedEnvelope = { envelope: string; expiresInSeconds: number; caseWrites: string[] };
+
+/**
+ * Ask the control plane for authority to act as one node of this run.
+ *
+ * Every call re-derives the grant against durable run state, so an envelope cannot
+ * outlive the lease it was issued under.
+ */
+async function requestExecutionEnvelope(
+  context: RuntimeContext,
+  nodeId: string,
+  invocationId: string,
+): Promise<IssuedEnvelope> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${context.serviceToken}`,
+    "x-runtime-grant": context.executionGrant,
+    "content-type": "application/json",
+  };
+  injectTraceContext(headers);
+  const response = await fetch(`${context.envelopeBrokerUrl}/v1/runtime/envelopes`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ runId: context.runId, nodeId, attempt: context.runAttempt, invocationId }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body = await response.json() as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(body.error ?? "runtime.envelope_denied"));
+  const envelope = typeof body.envelope === "string" ? body.envelope : "";
+  if (!envelope) throw new Error("runtime.envelope_invalid");
+  return {
+    envelope,
+    expiresInSeconds: Number(body.expiresInSeconds ?? 0),
+    caseWrites: Array.isArray(body.caseWrites) ? body.caseWrites.map(String) : [],
+  };
+}
 
 type CaseWriteScope = {
   case: Record<string, unknown>;
@@ -172,18 +217,7 @@ export async function invokeCapability(
   // Stable across worker crashes so a resumed checkpoint replays the gateway receipt
   // instead of repeating a paid or externally-visible operation.
   const invocationId = `${context.runId}:${nodeId}:${stableDigest(input).slice(0, 24)}`;
-  const token = await mintExecutionEnvelope({
-    secret: context.executionSecret,
-    invocationId,
-    runId: context.runId,
-    nodeId,
-    attempt: context.runAttempt,
-    planDigest: context.plan.planDigest,
-    permissionDigest: permission.digest,
-    capabilities: permission.capabilities,
-    effects: permission.effects,
-    fencingEpoch: context.fencingEpoch,
-  });
+  const issued = await requestExecutionEnvelope(context, nodeId, invocationId);
   return withSpan("capability.request", {
     kind: SpanKind.CLIENT,
     attributes: {
@@ -197,7 +231,8 @@ export async function invokeCapability(
     },
   }, async (span) => {
     const headers: Record<string, string> = {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${context.serviceToken}`,
+      "x-execution-envelope": issued.envelope,
       "content-type": "application/json",
     };
     injectTraceContext(headers);
@@ -237,7 +272,11 @@ async function caseRequest(
       "harness.plan.digest_prefix": context.plan.planDigest.slice(0, 12),
     },
   }, async (span) => {
-    const headers: Record<string, string> = { "content-type": "application/json", ...(init.headers as Record<string, string> ?? {}) };
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${context.serviceToken}`,
+      "content-type": "application/json",
+      ...(init.headers as Record<string, string> ?? {}),
+    };
     injectTraceContext(headers);
     const response = await fetch(`${context.caseApiUrl}${path}`, { ...init, headers, signal: AbortSignal.timeout(10_000) });
     span.setAttribute("http.response.status_code", response.status);
@@ -294,6 +333,11 @@ export async function executeCaseWrites(
     executionId: context.runId,
     roles: [],
   };
+  // Case writes are an effect, so they carry the same node-scoped authority as a
+  // capability call. The case service checks each command against the command types the
+  // plan declared for this node rather than trusting the runtime to have read the plan.
+  const issued = await requestExecutionEnvelope(context, nodeId, `${context.runId}:${nodeId}:case-writes:${context.runAttempt}`);
+  const executionHeaders = { "x-execution-envelope": issued.envelope };
   const capture = node?.config.evidenceCapture;
   if (capture && typeof capture === "object" && !Array.isArray(capture)) {
     const captureConfig = capture as Record<string, unknown>;
@@ -323,7 +367,7 @@ export async function executeCaseWrites(
     });
     const registered = await caseRequest(context, "evidence.register", "/v1/evidence:register", {
       method: "POST",
-      headers: { "idempotency-key": `${context.runId}:${context.runAttempt}:${nodeId}:evidence` },
+      headers: { ...executionHeaders, "idempotency-key": `${context.runId}:${context.runAttempt}:${nodeId}:evidence` },
       body: JSON.stringify(evidenceRequest),
     });
     const evidence = registered.evidence;
@@ -358,10 +402,10 @@ export async function executeCaseWrites(
     });
     await caseRequest(context, "case.command", `/v1/cases/${encodeURIComponent(caseId)}/commands`, {
       method: "POST",
+      headers: executionHeaders,
       body: JSON.stringify(command),
     });
-    await appendEvent(context.db, {
-      runId: context.runId,
+    await context.state.appendEvent(fencedRun(context), {
       eventKey: `case-write:${nodeId}:${context.runAttempt}:${index}`,
       code: "case.write.completed",
       nodeId,
@@ -371,6 +415,16 @@ export async function executeCaseWrites(
   }
 }
 
+/** Identity of the fenced attempt this runtime is journaling under. */
+export function fencedRun(context: RuntimeContext): FencedRun {
+  return {
+    runId: context.runId,
+    attempt: context.runAttempt,
+    workerId: context.workerId,
+    fencingEpoch: context.fencingEpoch,
+  };
+}
+
 export async function executeObservedNode<T>(
   context: RuntimeContext,
   nodeId: string,
@@ -378,6 +432,7 @@ export async function executeObservedNode<T>(
   execute: () => Promise<T>,
 ): Promise<T> {
   const node = context.plan.graph.nodes.find((item) => item.id === nodeId);
+  const run = fencedRun(context);
   return withSpan("workflow.transition", {
     kind: SpanKind.INTERNAL,
     attributes: {
@@ -390,33 +445,32 @@ export async function executeObservedNode<T>(
     },
   }, async (span) => {
     const spanRef = traceReference(span);
-    await updateRunNode(context.db, {
-      runId: context.runId, workerId: context.workerId,
-      fencingEpoch: context.fencingEpoch, nodeId,
+    // Only digests cross this boundary: the journal records that a node ran and what its
+    // input and output hashed to, never the values themselves.
+    await context.state.nodeStarted(run, {
+      nodeId,
+      inputDigest: stableDigest(input),
+      traceId: spanRef.traceId,
+      spanId: spanRef.spanId,
     });
-    await beginNodeAttempt(context.db, {
-      runId: context.runId, nodeId, attempt: context.runAttempt,
-      fencingEpoch: context.fencingEpoch, value: input,
-      traceId: spanRef.traceId, spanId: spanRef.spanId,
-    });
-    await appendEvent(context.db, {
-      runId: context.runId, eventKey: `node:${nodeId}:${context.runAttempt}:started`,
+    await context.state.appendEvent(run, {
+      eventKey: `node:${nodeId}:${context.runAttempt}:started`,
       code: "node.started", nodeId, status: "observed", values: {},
     });
     try {
       const result = await execute();
       span.setAttribute("harness.outcome", "COMPLETED");
-      await finishNodeAttempt(context.db, { runId: context.runId, nodeId, attempt: context.runAttempt, status: "completed", value: result });
-      await appendEvent(context.db, {
-        runId: context.runId, eventKey: `node:${nodeId}:${context.runAttempt}:completed`,
+      await context.state.nodeFinished(run, { nodeId, status: "completed", outputDigest: stableDigest(result) });
+      await context.state.appendEvent(run, {
+        eventKey: `node:${nodeId}:${context.runAttempt}:completed`,
         code: "node.completed", nodeId, status: "passed", values: {},
       });
       return result;
     } catch (error) {
       const code = error instanceof Error ? error.message : "runtime.node_failed";
-      await finishNodeAttempt(context.db, { runId: context.runId, nodeId, attempt: context.runAttempt, status: "failed", errorCode: code });
-      await appendEvent(context.db, {
-        runId: context.runId, eventKey: `node:${nodeId}:${context.runAttempt}:failed`,
+      await context.state.nodeFinished(run, { nodeId, status: "failed", errorCode: code });
+      await context.state.appendEvent(run, {
+        eventKey: `node:${nodeId}:${context.runAttempt}:failed`,
         code: "node.failed", nodeId, status: "failed", values: { errorCode: code },
       });
       throw error;

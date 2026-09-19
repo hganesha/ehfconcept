@@ -31,6 +31,8 @@ struct Package {
     workflow: String,
     budgets: Value,
     #[serde(default)] model_profiles: Vec<String>,
+    #[serde(default)] skills: Vec<Value>,
+    #[serde(default)] agents: Vec<Value>,
     capabilities: Vec<Capability>,
     #[serde(default)] bindings: BTreeMap<String, String>,
 }
@@ -45,13 +47,28 @@ struct Capability {
     kind: String,
     effect: String,
     adapter_binding_id: String,
-    #[serde(default)] input_schema: Value,
-    #[serde(default)] output_schema: Value,
+    #[serde(default = "empty_object")] input_schema: Value,
+    #[serde(default = "empty_object")] output_schema: Value,
     timeout_ms: u64,
     #[serde(default = "one")] max_attempts: u32,
     #[serde(default)] idempotent: bool,
 }
 fn one() -> u32 { 1 }
+fn empty_object() -> Value { json!({}) }
+
+/// Fill the array-valued defaults declared by the plan contract.
+///
+/// The emitted plan must already be schema-complete. `HarnessPlan` is validated with
+/// zod on the way in, and zod applies defaults during parsing -- so a document that
+/// omits an optional-with-default key parses into a *different* value than the one the
+/// compiler digested, and the plan then fails digest verification at admission. Emitting
+/// the defaults here keeps exactly one canonical form of a plan.
+fn fill_array_defaults(value: &mut Value, keys: &[&str]) {
+    let Some(object) = value.as_object_mut() else { return };
+    for key in keys {
+        object.entry(*key).or_insert_with(|| json!([]));
+    }
+}
 
 fn canonical(value: Value) -> Value {
     match value {
@@ -78,6 +95,42 @@ fn dependency_manifest(root: &Path) -> Result<Vec<Value>> {
     }).collect()
 }
 
+/// Node configuration carried by the authoring source but not modelled by `lgir-core`.
+///
+/// `lgir_core::NodeConfig` is a closed struct: deserializing a node drops every key it
+/// does not declare. That is correct for Ladder Graph's own semantics, but the harness
+/// layers authority-bearing declarations on top of the same `config` block --
+/// `caseWrites` (which canonical BusinessCommands a node may submit), `agentRef`,
+/// `skillRefs`, `runtimeTarget`. Compiling through the normalizer alone silently
+/// discarded all of them, so a plan would validate, admit, and run while quietly having
+/// no case-write authority at all.
+///
+/// The modelled key set is read back off the normalized value rather than hard-coded, so
+/// a later `lgir-core` revision that starts modelling one of these keys takes ownership
+/// of it automatically and normalization keeps winning.
+fn merge_extension_config(normalized: &mut Value, source: Option<&Value>) {
+    let Some(Value::Object(source_config)) = source else { return };
+    let Some(target) = normalized.as_object_mut() else { return };
+    for (key, value) in source_config {
+        if target.contains_key(key) { continue; }
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+/// Per-node `config` blocks exactly as the author wrote them, keyed by node id.
+fn source_node_configs(workflow_source: &str) -> Result<BTreeMap<String, Value>> {
+    let document: Value = serde_yaml_ng::from_str(workflow_source).context("parse workflow for extension config")?;
+    let nodes = document.get("spec").and_then(|spec| spec.get("nodes")).and_then(Value::as_array);
+    let mut configs = BTreeMap::new();
+    for node in nodes.unwrap_or(&Vec::new()) {
+        let Some(id) = node.get("id").and_then(Value::as_str) else { continue };
+        if let Some(config) = node.get("config") {
+            configs.insert(id.to_string(), config.clone());
+        }
+    }
+    Ok(configs)
+}
+
 fn load_package(dir: &Path) -> Result<(Package, String)> {
     let source = fs::read_to_string(dir.join("package.yaml")).context("read package.yaml")?;
     let package: Package = serde_yaml_ng::from_str(&source).context("parse package.yaml")?;
@@ -95,11 +148,13 @@ fn compile(dir: &Path, profiles_path: &Path) -> Result<Value> {
         bail!("LGIR validation failed:\n{}", serde_json::to_string_pretty(&analysis.diagnostics)?);
     }
     let workflow = analysis.normalized.context("LGIR returned no normalized workflow")?;
+    let source_configs = source_node_configs(&workflow_source)?;
     let capability_by_id = package.capabilities.iter().map(|item| (item.id.as_str(), item)).collect::<BTreeMap<_, _>>();
     let mut envelopes = Vec::new();
     let nodes = workflow.spec.nodes.iter().map(|node| {
         let binding = package.bindings.get(&node.id);
         let mut config = serde_json::to_value(&node.config).unwrap_or(json!({}));
+        merge_extension_config(&mut config, source_configs.get(&node.id));
         if let Some(capability_id) = binding {
             config.as_object_mut().unwrap().insert("capabilityId".into(), json!(capability_id));
             let capability = capability_by_id.get(capability_id.as_str()).with_context(|| format!("binding capability missing: {capability_id}"))?;
@@ -128,6 +183,17 @@ fn compile(dir: &Path, profiles_path: &Path) -> Result<Value> {
             .with_context(|| format!("model profile missing: {id}"))?;
         Ok(json!({ "id": id, "digest": digest(profile) }))
     }).collect::<Result<Vec<Value>>>()?;
+    // A plan carries only the capabilities a node can actually reach. Everything else the
+    // package declares stays out of the executable artifact: the permission envelopes are
+    // the authority, and an unreachable definition in the plan is only blast radius.
+    let mut skills = package.skills.clone();
+    for skill in &mut skills { fill_array_defaults(skill, &["allowedCapabilityIds"]); }
+    let mut agents = package.agents.clone();
+    for agent in &mut agents { fill_array_defaults(agent, &["skillIds", "caseWrites"]); }
+    let bound_capability_ids = package.bindings.values().collect::<std::collections::BTreeSet<_>>();
+    let capabilities = package.capabilities.iter()
+        .filter(|capability| bound_capability_ids.contains(&capability.id))
+        .collect::<Vec<_>>();
     let dependencies = dependency_manifest(dir)?;
     let package_digest = digest(&Value::Array(dependencies.clone()));
     let content = json!({
@@ -137,7 +203,9 @@ fn compile(dir: &Path, profiles_path: &Path) -> Result<Value> {
         "execution": { "engine": { "kind": "langgraph-js", "adapterVersion": "harness-langgraph-v1", "profile": "poc-v1" }, "maxTransitions": 200, "maxConcurrency": workflow.spec.policies.max_concurrency, "durability": "sync" },
         "budgets": package.budgets,
         "schemas": { "input": workflow.spec.inputs, "output": workflow.spec.outputs },
-        "modelProfiles": model_profiles, "capabilities": package.capabilities,
+        "modelProfiles": model_profiles,
+        "skills": skills, "agents": agents,
+        "capabilities": capabilities,
         "permissionEnvelopes": envelopes,
         "graph": { "apiVersion": "ladder.dev/v1alpha1", "name": workflow.metadata.name, "nodes": nodes, "edges": edges, "nodeOrder": analysis.node_order },
         "dependencyManifest": dependencies,
@@ -165,4 +233,59 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_config_keys_the_normalizer_does_not_model() {
+        // The regression: lgir-core's NodeConfig is a closed struct, so compiling through
+        // it alone dropped caseWrites/agentRef/skillRefs/runtimeTarget and produced a plan
+        // with no case-write authority that still validated and ran.
+        let mut normalized = json!({ "operation": "", "expression": "" });
+        let source = json!({
+            "operation": "should-not-override",
+            "caseWrites": [{ "commandType": "AddSubject" }],
+            "agentRef": "agent.kyc.policy.v1",
+            "runtimeTarget": "local_http",
+        });
+        merge_extension_config(&mut normalized, Some(&source));
+        assert_eq!(normalized["operation"], json!(""), "normalization must win for modelled keys");
+        assert_eq!(normalized["agentRef"], json!("agent.kyc.policy.v1"));
+        assert_eq!(normalized["runtimeTarget"], json!("local_http"));
+        assert_eq!(normalized["caseWrites"][0]["commandType"], json!("AddSubject"));
+    }
+
+    #[test]
+    fn reads_source_config_per_node() {
+        let configs = source_node_configs(
+            "spec:\n  nodes:\n    - id: a\n      config:\n        agentRef: x\n    - id: b\n",
+        ).expect("parse");
+        assert_eq!(configs["a"]["agentRef"], json!("x"));
+        assert!(!configs.contains_key("b"), "a node without config contributes nothing");
+    }
+
+    #[test]
+    fn fills_contract_defaults_so_parsing_is_a_no_op() {
+        let mut agent = json!({ "id": "agent.a" });
+        fill_array_defaults(&mut agent, &["skillIds", "caseWrites"]);
+        assert_eq!(agent["skillIds"], json!([]));
+        assert_eq!(agent["caseWrites"], json!([]));
+
+        let mut existing = json!({ "skillIds": ["s1"] });
+        fill_array_defaults(&mut existing, &["skillIds"]);
+        assert_eq!(existing["skillIds"], json!(["s1"]), "an authored value is never replaced");
+    }
+
+    #[test]
+    fn canonical_ordering_matches_utf8_byte_order() {
+        // The TypeScript side re-digests plans with a code-unit sort; these must agree.
+        let value = canonical(json!({ "Zebra": 1, "apple": 2, "Apple": 3, "a_b": 4, "aB": 5 }));
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"Apple":3,"Zebra":1,"aB":5,"a_b":4,"apple":2}"#,
+        );
+    }
 }

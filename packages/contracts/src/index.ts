@@ -197,6 +197,7 @@ export const runStatusSchema = z.enum([
   "manual_review",
   "denied",
   "failed",
+  "cancelled",
 ]);
 
 export const runRequestSchema = z.object({
@@ -242,6 +243,20 @@ export const runtimeEventSchema = z.object({
 
 export const runtimeProviderKindSchema = z.enum(["local_http", "azure_foundry"]);
 
+/**
+ * Provider-observed state of an invocation.
+ *
+ * Needed because a dispatcher that loses contact with a provider mid-invocation cannot
+ * otherwise tell "still running" from "finished, and the result is lost" -- and the
+ * difference decides whether a retry is safe.
+ */
+export const runtimeInvocationStatusSchema = z.object({
+  contractVersion: z.literal("runtime.status.v1"),
+  invocationId: z.string().min(1),
+  state: z.enum(["pending", "running", "completed", "failed", "cancelled", "unknown"]),
+  providerMetadata: z.record(z.string(), z.string()).default({}),
+}).strict();
+
 export const runtimeInvocationSchema = z.object({
   contractVersion: z.literal("runtime.invocation.v1"),
   invocationId: z.string().min(1),
@@ -253,6 +268,8 @@ export const runtimeInvocationSchema = z.object({
   deadlineAt: z.string().datetime(),
   planDigest: z.string().regex(/^[a-f0-9]{64}$/),
   executionProfileDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  /** Short-lived, audience-bound authority for this invocation. Never a reusable secret. */
+  executionGrant: z.string().min(1),
   plan: harnessPlanSchema,
   input: z.unknown(),
 }).strict().superRefine((value, ctx) => {
@@ -374,9 +391,44 @@ export const executionEnvelopeClaimsSchema = z.object({
   permission_digest: z.string().regex(/^[a-f0-9]{64}$/),
   capabilities: z.array(z.string()),
   effects: z.array(effectClassSchema),
+  /**
+   * Canonical command types the plan declares this node may submit. The case service
+   * checks a command against this list, so a runtime cannot invent a case write the
+   * compiled plan never granted it.
+   */
+  case_writes: z.array(businessCommandTypeSchema).default([]),
   fencing_epoch: z.number().int().nonnegative(),
   iat: z.number().int(),
   exp: z.number().int(),
+}).strict();
+
+/**
+ * Authority the dispatcher hands to a runtime for the length of one invocation.
+ *
+ * The runtime used to hold the envelope signing secret and mint its own capability
+ * envelopes, which meant a compromised runtime -- in Azure, a hosted agent the platform
+ * does not control -- could grant itself any capability, effect, node or epoch it liked.
+ * It now receives this grant instead and exchanges it, per node, at the control plane,
+ * which re-checks the lease and fence before signing anything.
+ */
+export const runtimeGrantClaimsSchema = z.object({
+  iss: z.string().min(1),
+  aud: z.string().min(1),
+  jti: z.string().min(1),
+  run_id: z.string().min(1),
+  attempt: z.number().int().positive(),
+  worker_id: z.string().min(1),
+  plan_digest: z.string().regex(/^[a-f0-9]{64}$/),
+  fencing_epoch: z.number().int().positive(),
+  iat: z.number().int(),
+  exp: z.number().int(),
+}).strict();
+
+export const envelopeRequestSchema = z.object({
+  runId: z.string().min(1),
+  nodeId: z.string().min(1),
+  attempt: z.number().int().nonnegative(),
+  invocationId: z.string().min(1),
 }).strict();
 
 export const capabilityRequestSchema = z.object({
@@ -481,6 +533,7 @@ export type RunRecord = z.infer<typeof runRecordSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;
 export type RuntimeEvent = z.infer<typeof runtimeEventSchema>;
 export type RuntimeProviderKind = z.infer<typeof runtimeProviderKindSchema>;
+export type RuntimeInvocationStatus = z.infer<typeof runtimeInvocationStatusSchema>;
 export type RuntimeInvocation = z.infer<typeof runtimeInvocationSchema>;
 export type RuntimeInvocationResult = z.infer<typeof runtimeInvocationResultSchema>;
 export type KycCaseStatus = z.infer<typeof kycCaseStatusSchema>;
@@ -492,6 +545,8 @@ export type BusinessCommandType = z.infer<typeof businessCommandTypeSchema>;
 export type RegisterEvidenceRequest = z.infer<typeof registerEvidenceRequestSchema>;
 export type CommandOutcome = z.infer<typeof commandOutcomeSchema>;
 export type ExecutionEnvelopeClaims = z.infer<typeof executionEnvelopeClaimsSchema>;
+export type RuntimeGrantClaims = z.infer<typeof runtimeGrantClaimsSchema>;
+export type EnvelopeRequest = z.infer<typeof envelopeRequestSchema>;
 export type CapabilityRequest = z.infer<typeof capabilityRequestSchema>;
 export type CapabilityResult = z.infer<typeof capabilityResultSchema>;
 export type AuthoringStatus = z.infer<typeof authoringStatusSchema>;
@@ -502,13 +557,24 @@ export type SkillRegistration = z.infer<typeof skillRegistrationSchema>;
 export type AgentRegistration = z.infer<typeof agentRegistrationSchema>;
 export type EvaluationReport = z.infer<typeof evaluationReportSchema>;
 
+// The Rust compiler canonicalizes through a BTreeMap, which orders keys by their
+// UTF-8 bytes. JavaScript string comparison orders by UTF-16 code unit, which agrees
+// with UTF-8 byte order for every code point. localeCompare does not: it is ICU- and
+// locale-sensitive ("a" sorts before "Z", "aB" after "a_b"), so a plan compiled by
+// harnessc and re-digested here would not verify once a key carried a capital letter
+// or an underscore. Key ordering is part of the plan trust root; it must not depend
+// on the host's collation tables.
+function byCodeUnit(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .filter(([, nested]) => nested !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => byCodeUnit(left, right))
         .map(([key, nested]) => [key, canonicalize(nested)]),
     );
   }

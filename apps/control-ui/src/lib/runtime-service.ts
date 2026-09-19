@@ -36,6 +36,42 @@ const jaegerBase = (process.env.JAEGER_API_INTERNAL_URL ?? "http://127.0.0.1:166
 const caseBase = (process.env.CASE_API_INTERNAL_URL ?? "http://127.0.0.1:4102").replace(/\/$/, "");
 const caseTenantId = process.env.CASE_UI_TENANT_ID ?? "tenant_demo";
 
+/**
+ * Credential the control surface presents to the internal services.
+ *
+ * This module is the backend-for-frontend: it is the only component that has seen the
+ * user, so it proves it is the edge and carries the acting persona onwards. The services
+ * believe the persona only because the edge credential came with it -- the actor and
+ * tenant headers used to be accepted from anyone.
+ */
+const edgeServiceToken = process.env.EDGE_SERVICE_TOKEN ?? "";
+
+export type EdgePersona = "operator" | "approver";
+
+const personas: Record<EdgePersona, { actorId: string; roles: string }> = {
+  operator: {
+    actorId: process.env.CONTROL_UI_ACTOR_ID ?? "local-author",
+    roles: process.env.CONTROL_UI_ACTOR_ROLES
+      ?? "Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer",
+  },
+  // Approval and publication run as a separate persona so the local demo exercises the
+  // same separation of duties the deployed roles describe, instead of one identity
+  // authoring and approving its own plan.
+  approver: {
+    actorId: process.env.CONTROL_UI_APPROVER_ID ?? "local-approver",
+    roles: process.env.CONTROL_UI_APPROVER_ROLES ?? "Harness.Reader,Harness.Approver",
+  },
+};
+
+function edgeHeaders(persona: EdgePersona = "operator"): Record<string, string> {
+  const identity = personas[persona];
+  return {
+    ...(edgeServiceToken ? { authorization: `Bearer ${edgeServiceToken}` } : {}),
+    "x-actor-id": identity.actorId,
+    "x-actor-roles": identity.roles,
+  };
+}
+
 type JsonMap = Record<string, unknown>;
 type RawPlan = {
   apiVersion: string;
@@ -146,7 +182,11 @@ const KNOWN_EVENT_CODES = new Set([
 ]);
 
 async function apiJson<T>(base: string, path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${base}${path}`, { cache: "no-store", ...init });
+  const response = await fetch(`${base}${path}`, {
+    cache: "no-store",
+    ...init,
+    headers: { ...edgeHeaders(), ...(init?.headers as Record<string, string> | undefined) },
+  });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = body as { error?: string; message?: string };
@@ -164,6 +204,8 @@ async function optionalJson<T>(base: string, path: string): Promise<T | null> {
 }
 
 function caseHeaders(): HeadersInit {
+  // The tenant is a requested scope; the case service checks it against the assignment
+  // the edge credential already carries and rejects anything wider.
   return { "x-tenant-id": caseTenantId };
 }
 
@@ -399,7 +441,7 @@ export async function admitCompiledPlan(rawText: string): Promise<{
   const digest = (parsed as { planDigest?: unknown }).planDigest;
   const response = await fetch(`${controlBase}/v1/plans`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...edgeHeaders() },
     body: JSON.stringify(parsed),
     cache: "no-store",
   });
@@ -590,7 +632,7 @@ export async function startNewRun(params: { planDigest: string; inputPayload: Js
 }> {
   const response = await fetch(`${controlBase}/v1/runs`, {
     method: "POST",
-    headers: { "content-type": "application/json", "idempotency-key": params.idempotencyKey },
+    headers: { "content-type": "application/json", "idempotency-key": params.idempotencyKey, ...edgeHeaders() },
     body: JSON.stringify({ planDigest: params.planDigest, input: params.inputPayload }),
     cache: "no-store",
   });
@@ -1193,21 +1235,24 @@ export async function getAuthoringDraftView(draftId: string): Promise<AuthoringD
 
 export async function createAuthoringDraftView(input: { packageSource?: string; workflowSource?: string }): Promise<AuthoringDraftView> {
   const draft = await apiJson<RawAuthoringDraft>(controlBase, "/v1/authoring/drafts", {
-    method: "POST", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input),
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
   });
   return mapAuthoringDraft(draft);
 }
 
 export async function updateAuthoringDraftView(draftId: string, input: { expectedRevision: number; packageSource: string; workflowSource: string }): Promise<AuthoringDraftView> {
   const draft = await apiJson<RawAuthoringDraft>(controlBase, `/v1/authoring/drafts/${encodeURIComponent(decodeURIComponent(draftId))}`, {
-    method: "PUT", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input),
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
   });
   return mapAuthoringDraft(draft);
 }
 
 export async function advanceAuthoringDraft(draftId: string, action: "compile" | "evaluate" | "approve" | "publish"): Promise<AuthoringDraftView> {
+  // Approval and publication are the approver's actions; compile and evaluate are the
+  // author's. Sending both as one identity is what made self-approval invisible.
+  const persona: EdgePersona = action === "approve" || action === "publish" ? "approver" : "operator";
   const draft = await apiJson<RawAuthoringDraft>(controlBase, `/v1/authoring/drafts/${encodeURIComponent(decodeURIComponent(draftId))}/${action}`, {
-    method: "POST", headers: { "x-actor-id": "local-author" },
+    method: "POST", headers: edgeHeaders(persona),
   });
   return mapAuthoringDraft(draft);
 }
@@ -1233,27 +1278,27 @@ export async function listAuthoringSkillsView(): Promise<SkillRegistryItemView[]
 }
 
 export async function registerAuthoringSkillView(input: unknown): Promise<{ created: boolean } & SkillRegistryItemView> {
-  return apiJson(controlBase, "/v1/authoring/skills", { method: "POST", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input) });
+  return apiJson(controlBase, "/v1/authoring/skills", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
 }
 
 export async function registerAuthoringAgentView(input: unknown): Promise<{ created: boolean } & AgentRegistryItemView> {
-  return apiJson(controlBase, "/v1/authoring/agents", { method: "POST", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input) });
+  return apiJson(controlBase, "/v1/authoring/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
 }
 
 export async function importAuthoringAgentFromGithub(url: string): Promise<{ agent: { created: boolean } & AgentRegistryItemView; skills: Array<{ created: boolean } & SkillRegistryItemView> }> {
-  return apiJson(controlBase, "/v1/authoring/import/github", { method: "POST", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify({ url }) });
+  return apiJson(controlBase, "/v1/authoring/import/github", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url }) });
 }
 
 export async function attachAuthoringAgentView(draftId: string, agentId: string, input: { expectedRevision: number; nodeId: string; mode: "replace" | "insert-after"; newNodeId?: string }): Promise<{ draft: AuthoringDraftView; attachedNodeId: string }> {
   const result = await apiJson<{ draft: RawAuthoringDraft; attachedNodeId: string }>(controlBase, `/v1/authoring/drafts/${encodeURIComponent(decodeURIComponent(draftId))}/agents/${encodeURIComponent(agentId)}/attach`, {
-    method: "POST", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input),
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
   });
   return { draft: mapAuthoringDraft(result.draft), attachedNodeId: result.attachedNodeId };
 }
 
 export async function updateNodeCaseWritesView(draftId: string, nodeId: string, input: { expectedRevision: number; caseWrites: unknown[] }): Promise<AuthoringDraftView> {
   const draft = await apiJson<RawAuthoringDraft>(controlBase, `/v1/authoring/drafts/${encodeURIComponent(decodeURIComponent(draftId))}/nodes/${encodeURIComponent(nodeId)}/case-writes`, {
-    method: "PUT", headers: { "content-type": "application/json", "x-actor-id": "local-author" }, body: JSON.stringify(input),
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
   });
   return mapAuthoringDraft(draft);
 }

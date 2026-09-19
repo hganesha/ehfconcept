@@ -3,12 +3,18 @@ import { stableDigest, type RuntimeInvocation } from "@ehf/contracts";
 import {
   appendEvent,
   bindRunTrace,
+  cancellationRequested,
   claimRun,
+  completeCancelledRun,
   completeRun,
   createDatabase,
+  failExhaustedRuns,
+  finalizeAbandonedCancellations,
   getPlan,
   renewLease,
+  scheduleRunRetry,
 } from "@ehf/persistence";
+import { mintRuntimeGrant } from "@ehf/execution-auth";
 import { createRuntimeProviderFromEnv } from "@ehf/runtime-provider";
 import {
   SpanKind,
@@ -29,10 +35,33 @@ function requiredEnv(name: string, error: string): string {
 }
 
 const connectionString = requiredEnv("DATABASE_URL", "database.url_missing");
+// The dispatcher owns the lease and the fence, so it is the only component that may
+// issue authority for an invocation. The runtime receives a grant, never a signing key.
+const grantSecret = requiredEnv("RUNTIME_GRANT_SECRET", "runtime.grant_secret_missing");
 const db = createDatabase(connectionString);
 const workerId = process.env.WORKER_ID ?? `${hostname()}:${process.pid}`;
 const leaseSeconds = Number(process.env.WORKER_LEASE_SECONDS ?? 60);
 const pollMs = Number(process.env.WORKER_POLL_MS ?? 750);
+const retryBaseMs = Number(process.env.WORKER_RETRY_BASE_MS ?? 2_000);
+const retryMaxMs = Number(process.env.WORKER_RETRY_MAX_MS ?? 60_000);
+
+/**
+ * A denial is a decision, not a fault.
+ *
+ * Retrying a denied capability call would re-ask a question the gateway already answered,
+ * and retrying a plan or contract problem would repeat it forever. Everything else --
+ * transport failures, provider unavailability, timeouts -- is worth another attempt.
+ */
+function retryable(code: string): boolean {
+  if (code.includes("denied") || code.includes("authorization") || code.includes("stale_fence")) return false;
+  return !code.startsWith("runtime.plan_") && !code.startsWith("langgraph.") && !code.includes("contract");
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(retryMaxMs, retryBaseMs * 2 ** Math.max(0, attempt - 1));
+}
+
+
 
 async function workOnce(): Promise<boolean> {
   const run = await claimRun(db, workerId, leaseSeconds);
@@ -92,13 +121,38 @@ async function workOnce(): Promise<boolean> {
         executionProfileDigest: provider.executionProfileDigest,
       },
     });
+    // Losing the lease means another worker now owns this run at a higher fence. The
+    // renewal result used to be discarded, so a superseded worker kept executing and
+    // only its gateway calls were refused -- everything else it did carried on.
+    const leaseLost = new AbortController();
+    const cancelled = new AbortController();
     const heartbeat = setInterval(() => {
-      void renewLease(db, run.runId, workerId, run.fencingEpoch, leaseSeconds);
+      void renewLease(db, run.runId, workerId, run.fencingEpoch, leaseSeconds).then((held) => {
+        if (!held && !leaseLost.signal.aborted) leaseLost.abort(new Error("runtime.lease_lost"));
+      }).catch(() => { /* a failed renewal is retried on the next beat */ });
+      // Requesting a cancellation moves the fence, so the renewal above fails too. The
+      // marker is read as well so the run is recorded as cancelled rather than as a
+      // worker that simply lost its lease.
+      void cancellationRequested(db, run.runId).then((reason) => {
+        if (reason && !cancelled.signal.aborted) cancelled.abort(new Error("runtime.cancelled"));
+      }).catch(() => { /* re-read on the next beat */ });
     }, Math.max(1_000, Math.floor(leaseSeconds * 500)));
     try {
+      const invocationId = `INV-${stableDigest({ runId: run.runId, attempt: run.attempt, fencingEpoch: run.fencingEpoch }).slice(0, 32)}`;
+      const executionGrant = await mintRuntimeGrant({
+        secret: grantSecret,
+        grantId: invocationId,
+        runId: run.runId,
+        attempt: run.attempt,
+        workerId,
+        planDigest: run.planDigest,
+        fencingEpoch: run.fencingEpoch,
+        // Outlives the invocation deadline by a small margin and no more.
+        ttlSeconds: Math.ceil(plan.budgets.maxDurationMs / 1000) + 30,
+      });
       const invocation: RuntimeInvocation = {
         contractVersion: "runtime.invocation.v1",
-        invocationId: `INV-${stableDigest({ runId: run.runId, attempt: run.attempt, fencingEpoch: run.fencingEpoch }).slice(0, 32)}`,
+        invocationId,
         runId: claimedRun.runId,
         attempt: run.attempt,
         workerId,
@@ -107,10 +161,22 @@ async function workOnce(): Promise<boolean> {
         deadlineAt: new Date(Date.now() + plan.budgets.maxDurationMs).toISOString(),
         planDigest: run.planDigest,
         executionProfileDigest: provider.executionProfileDigest,
+        executionGrant,
         plan,
         input: run.input,
       };
-      const result = await provider.invoke(invocation, AbortSignal.timeout(plan.budgets.maxDurationMs + 5_000));
+      const result = await provider.invoke(invocation, AbortSignal.any([
+        AbortSignal.timeout(plan.budgets.maxDurationMs + 5_000),
+        leaseLost.signal,
+        cancelled.signal,
+      ])).catch(async (error: unknown) => {
+        // Ask the provider to stop as well: aborting our side of the call leaves the
+        // invocation running wherever it actually executes.
+        if (cancelled.signal.aborted) {
+          await provider.cancel(invocationId, "operator_request").catch(() => { /* best effort */ });
+        }
+        throw error;
+      });
       if (result.status === "completed") {
         await completeRun(db, {
           runId: run.runId,
@@ -139,15 +205,62 @@ async function workOnce(): Promise<boolean> {
         });
       } else {
         const errorCode = result.errorCode ?? `runtime.${result.status}`;
-        await recordTerminalFailure(errorCode, result.status === "denied");
+        await handleFailure(errorCode, result.status === "denied");
       }
     } catch (error) {
-      const code = error instanceof Error ? error.message : "runtime.unhandled";
-      await recordTerminalFailure(code, code.includes("denied"));
+      const code = cancelled.signal.aborted
+        ? "runtime.cancelled"
+        : leaseLost.signal.aborted
+          ? "runtime.lease_lost"
+          : error instanceof Error ? error.message : "runtime.unhandled";
+      if (code === "runtime.cancelled") {
+        span.setAttributes({ "harness.outcome": "CANCELLED", "harness.stop_reason": "cancellation_requested" });
+        span.setStatus({ code: SpanStatusCode.OK });
+        await completeCancelledRun(db, { runId: claimedRun.runId, errorCode: code });
+        await appendEvent(db, {
+          runId: claimedRun.runId,
+          eventKey: `run:${claimedRun.attempt}:cancelled`,
+          code: "run.cancelled",
+          nodeId: null,
+          status: "observed",
+          values: { traceId: root.traceId, runtimeProvider: provider.kind },
+        });
+      } else if (code === "runtime.lease_lost") {
+        // A superseded worker must not write terminal state: the fence guards the
+        // update, but there is no point attempting it either.
+        span.setAttribute("harness.outcome", "SUPERSEDED");
+      } else {
+        await handleFailure(code, code.includes("denied"));
+      }
     } finally {
       clearInterval(heartbeat);
     }
     return true;
+
+    async function handleFailure(code: string, denied: boolean): Promise<void> {
+      // The attempt budget lives on the run row, so scheduleRunRetry is the single
+      // authority on whether another attempt is allowed: it returns false once the
+      // budget is spent or the fence has moved, and the failure becomes terminal.
+      if (!denied && retryable(code)) {
+        const scheduled = await scheduleRunRetry(db, {
+          runId: claimedRun.runId, workerId, fencingEpoch: claimedRun.fencingEpoch,
+          errorCode: code, backoffMs: backoffMs(claimedRun.attempt),
+        });
+        if (scheduled) {
+          span.setAttributes({ "harness.outcome": "RETRYING", "harness.stop_reason": code });
+          await appendEvent(db, {
+            runId: claimedRun.runId,
+            eventKey: `run:${claimedRun.attempt}:retrying`,
+            code: "run.retrying",
+            nodeId: null,
+            status: "observed",
+            values: { errorCode: code, attempt: claimedRun.attempt, traceId: root.traceId },
+          });
+          return;
+        }
+      }
+      await recordTerminalFailure(code, denied);
+    }
 
     async function recordTerminalFailure(code: string, denied: boolean): Promise<void> {
       if (denied) {
@@ -180,9 +293,25 @@ async function workOnce(): Promise<boolean> {
 let stopping = false;
 process.on("SIGTERM", () => { stopping = true; });
 process.on("SIGINT", () => { stopping = true; });
+
+// A throw here used to reject at the top level and take the process with it, so one
+// unadmitted plan or one transport error turned into a container restart loop. The loop
+// absorbs failures; the claimed run is released by lease expiry and retried under the
+// normal attempt budget.
 while (!stopping) {
-  const worked = await workOnce();
-  if (!worked) await new Promise((resolve) => setTimeout(resolve, pollMs));
+  let worked = false;
+  try {
+    worked = await workOnce();
+  } catch (error) {
+    process.stderr.write(`dispatcher.iteration_failed ${error instanceof Error ? error.message : "unknown"}\n`);
+  }
+  if (!worked) {
+    try {
+      await failExhaustedRuns(db);
+      await finalizeAbandonedCancellations(db);
+    } catch { /* the sweep retries on the next idle poll */ }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
 }
 await db.end();
 await telemetry.shutdown();
