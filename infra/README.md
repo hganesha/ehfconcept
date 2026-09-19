@@ -9,38 +9,26 @@ Backlog items `AZ-008` (core Bicep modules and parameters) and `AZ-009` (OIDC
 validation, build, and deploy workflows) in the
 [migration plan](../docs/plans/azure-poc-migration-plan.md).
 
-## Verified against
-
-`main` at `1418c25` ("Complete P0/P1 production hardening").
+## Parity with the service contracts
 
 The service contracts these templates configure — environment variables, startup
 commands, image layout — come from `compose.yaml` and the per-service startup
-invariants. They move with the code, so after merging a newer `main`, re-run the
-parity check before deploying:
+invariants, and they move with the code. Rather than leave that to periodic
+re-derivation, the comparison is a check:
 
 ```bash
-# Every variable each compose service sets must appear in that service's
-# apps.bicep module, counting the shared telemetryEnv / caseStoreEnv /
-# platformEnv / workloadTokenEnv arrays it concatenates.
-python3 - <<'CHECK'
-import yaml, re, pathlib
-compose = yaml.safe_load(open("compose.yaml"))
-bicep = pathlib.Path("infra/apps.bicep").read_text()
-names = lambda b: set(re.findall(r"name: '([A-Z][A-Z0-9_]+)'", b))
-shared = {v: names(re.search(rf"var {v} = \[(.*?)\n\]", bicep, re.S).group(1))
-          for v in ("telemetryEnv", "caseStoreEnv", "platformEnv", "workloadTokenEnv")}
-blocks = dict(re.findall(r"module (\w+) 'modules/container-app\.bicep' = if \(!migrationOnly\) \{(.*?)\n\}", bicep, re.S))
-for c, b in {"control-api": "controlApi", "case-api": "caseApi", "capability-gateway": "gateway",
-             "runtime-host-local": "runtimeHost", "runtime-dispatcher": "dispatcher",
-             "control-ui": "controlUi"}.items():
-    have = names(blocks[b])
-    for var, vals in shared.items():
-        if re.search(rf"\b{var}\b", blocks[b]):
-            have |= vals
-    want = set(compose["services"][c].get("environment", {})) - {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"}
-    print(f"{c:20} missing={sorted(want - have) or '-'}")
-CHECK
+make parity          # or: ./scripts/check-deployment-parity.sh
 ```
+
+It resolves `compose.yaml` with `docker compose config`, so anchors and
+`${VAR:-default}` substitutions are compared as a service actually receives them,
+and it fails when a service gains a variable the templates do not pass, when a
+module would emit the same variable twice, or when compose defines a service the
+templates do not deploy at all. `make check` runs it, and so does the `validate`
+workflow on every pull request, so drift fails the build instead of surfacing
+after a deployment.
+
+Last verified green against `main` at `9925acd`.
 
 Also re-check the image layout: `Dockerfile` prunes per service with
 `SERVICE_FILTER`, so a new service means a new image in `build-images.yml` and a

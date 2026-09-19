@@ -1,16 +1,22 @@
-.PHONY: compile fixtures check up down demo demo-case demo-kyc-e2e logs trace
+.PHONY: compile parity fixtures check up down demo demo-case demo-kyc-e2e logs trace
 
 compile:
 	cargo build --release --locked -p harness-compiler
 	./target/release/harnessc compile domains/kyc --out artifacts/plans/kyc.plan.json
 	./target/release/harnessc compile domains/invoice --out artifacts/plans/invoice.plan.json
 
+# The Azure templates encode each service's environment; compose.yaml encodes the
+# same contract for the local stack. This fails when they disagree, which is
+# otherwise only discovered after deploying.
+parity:
+	./scripts/check-deployment-parity.sh
+
 fixtures:
 	cargo build --release --locked -p harness-compiler
 	./target/release/harnessc compile packages/contracts/test-fixtures/cross-compiler \
 		--out packages/contracts/test-fixtures/cross-compiler.plan.json
 
-check: compile
+check: compile parity
 	cargo test --workspace
 	pnpm check
 
