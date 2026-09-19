@@ -1,0 +1,79 @@
+name: validate
+
+# The repository had no CI at all, so nothing verified a pull request. This runs what
+# `make check` runs: the Rust compiler's own tests, then typecheck, tests and build across
+# the workspace.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The author plane shells out to harnessc, so its tests cannot run without the
+      # compiler built. edition 2024 needs a recent toolchain; rustup ships on the runner,
+      # so no third-party action is needed to get one.
+      - name: Install Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # corepack reads packageManager from package.json, which pins the pnpm version
+      # without trusting a third-party action to do it.
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare --activate
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          pnpm config set store-dir ~/.pnpm-store
+          pnpm install --frozen-lockfile --config.minimum-release-age=0
+
+      - name: Build the compiler of record
+        run: cargo build --release --locked -p harness-compiler
+
+      - name: Rust tests
+        run: cargo test --workspace --locked
+
+      # A stale fixture would silently stop guarding cross-compiler digest agreement,
+      # which is the check that catches canonicalization drift between the two paths.
+      - name: Cross-compiler fixture is current
+        run: |
+          make fixtures
+          git diff --exit-code -- packages/contracts/test-fixtures
+
+      - name: Compile the checked-in domains
+        run: make compile
+
+      - name: Typecheck, test and build
+        run: pnpm check
