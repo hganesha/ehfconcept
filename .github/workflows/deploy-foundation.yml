@@ -1,0 +1,137 @@
+# Stage 1-3 of the stamp: foundation, secrets, database.
+#
+# Idempotent by construction. Re-running deploys the same foundation, leaves
+# existing secrets untouched, and reconciles the database in place. It does not
+# build or deploy application images; deploy-apps.yml does that.
+name: deploy-foundation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'GitHub environment to deploy'
+        type: environment
+        required: true
+        default: poc
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Two concurrent foundation deployments against one resource group race on
+  # role assignments and the database.
+  group: foundation-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
+  deploy:
+    name: deploy foundation
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Fail with a readable message rather than inside azure/login, which
+      # reports a missing variable as an authentication error.
+      - name: check environment configuration
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Missing environment variables: ${missing[*]}" >&2
+            echo "Set them on the GitHub environment; see infra/README.md." >&2
+            exit 1
+          fi
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Stage 1: network, registry, monitoring, vault, identities, RBAC, and the
+      # Container Apps environment. No secret is involved.
+      - name: deploy foundation
+        id: foundation
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "foundation-${{ github.run_id }}" \
+            --template-file infra/main.bicep \
+            --parameters infra/environments/poc.bicepparam \
+            --query properties.outputs -o json > outputs.json
+
+          for key in keyVaultName keyVaultUri registryLoginServer containerAppsEnvironmentName \
+                     containerAppsDefaultDomain postgresServerName postgresSubnetId postgresPrivateDnsZoneId; do
+            value="$(jq -r ".${key}.value" outputs.json)"
+            echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          done
+
+      # Stage 2: generate the platform secrets, only where absent.
+      - name: seed secrets
+        run: ./scripts/azure/seed-secrets.sh "${{ steps.foundation.outputs.keyVaultName }}"
+
+      # Stage 3: the database reads its administrator password from the vault.
+      # The parameter file reads these from the environment, so the deployment
+      # has exactly one parameter source.
+      - name: deploy database
+        id: database
+        env:
+          POSTGRES_SERVER_NAME: ${{ steps.foundation.outputs.postgresServerName }}
+          KEY_VAULT_NAME: ${{ steps.foundation.outputs.keyVaultName }}
+          POSTGRES_SUBNET_ID: ${{ steps.foundation.outputs.postgresSubnetId }}
+          POSTGRES_DNS_ZONE_ID: ${{ steps.foundation.outputs.postgresPrivateDnsZoneId }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "database-${{ github.run_id }}" \
+            --template-file infra/database.bicep \
+            --parameters infra/environments/poc.database.bicepparam \
+            --query properties.outputs -o json > db-outputs.json
+
+          echo "fqdn=$(jq -r '.fullyQualifiedDomainName.value' db-outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "database=$(jq -r '.databaseName.value' db-outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "login=$(jq -r '.administratorLoginName.value' db-outputs.json)" >> "$GITHUB_OUTPUT"
+
+      # The connection string is composed inside the job and written straight to
+      # the vault; it is never an output, a log line, or a workflow variable.
+      - name: store connection string
+        run: |
+          ./scripts/azure/set-database-url.sh \
+            "${{ steps.foundation.outputs.keyVaultName }}" \
+            "${{ steps.database.outputs.fqdn }}" \
+            "${{ steps.database.outputs.database }}" \
+            "${{ steps.database.outputs.login }}"
+
+      - name: summary
+        run: |
+          {
+            echo '## Foundation deployed'
+            echo
+            echo "| Resource | Value |"
+            echo "| --- | --- |"
+            echo "| Resource group | \`${{ vars.AZURE_RESOURCE_GROUP }}\` |"
+            echo "| Registry | \`${{ steps.foundation.outputs.registryLoginServer }}\` |"
+            echo "| Key Vault | \`${{ steps.foundation.outputs.keyVaultName }}\` |"
+            echo "| Container Apps environment | \`${{ steps.foundation.outputs.containerAppsEnvironmentName }}\` |"
+            echo "| Environment domain | \`${{ steps.foundation.outputs.containerAppsDefaultDomain }}\` |"
+            echo "| PostgreSQL | \`${{ steps.database.outputs.fqdn }}\` |"
+            echo
+            echo 'Entra sign-in for the control surface is configured out of band:'
+            echo 'see docs/deploy/azure-deployment-runbook.md parts 1.3 and 9.2-9.3.'
+          } >> "$GITHUB_STEP_SUMMARY"

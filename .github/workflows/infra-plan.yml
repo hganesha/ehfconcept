@@ -1,0 +1,84 @@
+# What-if on pull requests that touch infrastructure. The reviewer sees the
+# resource-level diff before the change can merge.
+#
+# Only the foundation is planned. database.bicep and apps.bicep read live
+# resources (the vault's secret, the environment's default domain, the workload
+# identities), so a what-if against an environment that does not yet have a
+# foundation reports failures that say nothing about the change under review.
+# validate.yml still compiles all three templates on every pull request.
+name: infra-plan
+
+on:
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra-plan.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  what-if:
+    name: what-if against ${{ vars.AZURE_RESOURCE_GROUP }}
+    # Skipped until the poc environment has its federated identity. A what-if
+    # cannot run without a subscription to run it against, and failing red for a
+    # stamp that was never provisioned says nothing about the change under
+    # review.
+    if: vars.AZURE_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    environment: poc
+    steps:
+      - uses: actions/checkout@v5
+
+      # Workload identity federation only. There is no Azure client secret in
+      # this repository and none should ever be added.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: what-if
+        id: whatif
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters infra/environments/poc.bicepparam \
+            --result-format FullResourcePayload \
+            > whatif.txt 2>&1 || true
+          {
+            echo '## Foundation what-if'
+            echo
+            echo '```'
+            tail -c 60000 whatif.txt
+            echo '```'
+          } > whatif.md
+          cat whatif.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: what-if
+          path: whatif.txt
+
+  not-configured:
+    name: what-if skipped
+    if: vars.AZURE_CLIENT_ID == ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: explain
+        run: |
+          {
+            echo '## Foundation what-if skipped'
+            echo
+            echo 'No Azure identity is configured for the `poc` environment, so there is'
+            echo 'no subscription to plan against. The templates themselves were still'
+            echo 'compiled and linted by the `validate` workflow.'
+            echo
+            echo 'To enable planning, set these variables on the `poc` environment:'
+            echo '`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,'
+            echo '`AZURE_RESOURCE_GROUP`. See infra/README.md.'
+          } >> "$GITHUB_STEP_SUMMARY"
