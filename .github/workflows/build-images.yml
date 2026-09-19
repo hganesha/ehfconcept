@@ -41,6 +41,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Fail with a readable message rather than inside azure/login, which
+      # reports a missing variable as an authentication error.
+      - name: check environment configuration
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_CONTAINER_REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_CONTAINER_REGISTRY; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Missing environment variables: ${missing[*]}" >&2
+            echo "Set them on the GitHub environment; see infra/README.md." >&2
+            exit 1
+          fi
+
       - uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}

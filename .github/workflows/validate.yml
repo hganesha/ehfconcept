@@ -45,6 +45,12 @@ jobs:
       - name: compile domain packages
         run: make compile
 
+      # apps/control-api resolves the compiler of record at target/release/harnessc
+      # and fails closed when it is absent, so the release binary has to exist
+      # before pnpm check runs. `make compile` only produces a debug build.
+      - name: build the compiler of record
+        run: cargo build --release -p harness-compiler
+
       - name: cargo test
         run: cargo test --workspace
 

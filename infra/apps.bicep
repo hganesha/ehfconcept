@@ -53,11 +53,55 @@ param envelopeSecretName string = 'execution-envelope-secret'
 @description('Key Vault secret holding the runtime host bearer token.')
 param runtimeTokenSecretName string = 'runtime-host-token'
 
+@description('Key Vault secret holding the control-surface edge service token.')
+param edgeServiceTokenSecretName string = 'edge-service-token'
+
+@description('Key Vault secret holding the runtime workload service token.')
+param runtimeServiceTokenSecretName string = 'runtime-service-token'
+
+@description('Key Vault secret holding the dispatcher grant secret it exchanges for per-node envelopes.')
+param runtimeGrantSecretName string = 'runtime-grant-secret'
+
 @description('Key Vault secret holding the model provider key. Leave empty to run the deterministic recorded adapter, exactly as the local stack does without a key.')
 param modelProviderSecretName string = ''
 
-@description('Tenant used by the control surface. Configuration, not a verified claim, until AZ-002 lands.')
+@description('Tenant the local identity provider assigns. In azure mode the tenant comes from the verified principal instead.')
 param caseTenantId string = 'tenant_demo'
+
+// The services assert startup invariants for this mode. `azure` forbids every
+// shared secret below, forbids a password-bearing database URL, and requires
+// ENTRA_TENANT_ID, ENTRA_API_AUDIENCE, and PLATFORM_TENANT_ID. Those invariants
+// cannot be satisfied yet: packages/persistence still builds its pool from a
+// connection string, so passwordless PostgreSQL is still AZ-005. Deploying this
+// stamp in `local` mode is therefore deliberate and is stated as such in the
+// runbook's gap register, not an oversight.
+@description('Platform mode asserted at service startup. Keep local until AZ-005 lands; azure mode refuses to boot with the configuration this stamp deploys.')
+@allowed(['local', 'azure'])
+param platformMode string = 'local'
+
+@description('Identity provider. local_headers trusts the edge service token; entra validates Entra tokens.')
+@allowed(['local_headers', 'entra'])
+param identityProvider string = 'local_headers'
+
+// postgres keeps runs resumable and is the local default. memory lets the
+// runtime deploy with no database credential at all, which is what a hosted
+// agent outside the platform's trust boundary needs, at the cost of
+// resumability across a restart.
+@description('LangGraph checkpoint store for the runtime host.')
+@allowed(['postgres', 'memory'])
+param runtimeCheckpointBackend string = 'postgres'
+
+@description('Principal the control surface acts as in local identity mode.')
+param controlUiActorId string = 'local-author'
+
+@description('Roles for that principal. Deliberately excludes Harness.Approver.')
+param controlUiActorRoles string = 'Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer'
+
+@description('Separate approver principal, so publication cannot be self-approved.')
+param controlUiApproverId string = 'local-approver'
+
+@description('Roles for the approver principal.')
+param controlUiApproverRoles string = 'Harness.Reader,Harness.Approver'
 
 @description('Runtime provider binding. azure_foundry additionally requires the Foundry parameters and the hosted-agent wrapper from AZ-011.')
 @allowed(['local_http', 'azure_foundry'])
@@ -147,6 +191,9 @@ var urlJaegerOtlp = '${urlJaegerQuery}:4318/v1/traces'
 var databaseSecretUrl = '${keyVaultUri}/secrets/${databaseSecretName}'
 var envelopeSecretUrl = '${keyVaultUri}/secrets/${envelopeSecretName}'
 var runtimeTokenSecretUrl = '${keyVaultUri}/secrets/${runtimeTokenSecretName}'
+var edgeServiceTokenSecretUrl = '${keyVaultUri}/secrets/${edgeServiceTokenSecretName}'
+var runtimeServiceTokenSecretUrl = '${keyVaultUri}/secrets/${runtimeServiceTokenSecretName}'
+var runtimeGrantSecretUrl = '${keyVaultUri}/secrets/${runtimeGrantSecretName}'
 
 // Shared by every service so telemetry resource attributes stay consistent.
 var telemetryEnv = [
@@ -168,6 +215,23 @@ var telemetryEnv = [
   }
 ]
 
+// Mirrors the runtime-env anchor in compose.yaml. Every service that talks to
+// the control plane asserts these at startup.
+var platformEnv = [
+  {
+    name: 'PLATFORM_MODE'
+    value: platformMode
+  }
+  {
+    name: 'IDENTITY_PROVIDER'
+    value: identityProvider
+  }
+  {
+    name: 'LOCAL_DEFAULT_TENANT_ID'
+    value: caseTenantId
+  }
+]
+
 var caseStoreEnv = [
   {
     name: 'CASE_CORE_SCHEMA'
@@ -181,6 +245,18 @@ var caseStoreEnv = [
     name: 'EVIDENCE_SCHEMA'
     value: 'evidence'
   }
+  {
+    name: 'CASE_ARTIFACT_BACKEND'
+    value: 'postgres'
+  }
+  {
+    name: 'CASE_EVIDENCE_REQUIRE_SCAN'
+    value: 'false'
+  }
+  {
+    name: 'CASE_EVIDENCE_MAX_BYTES'
+    value: '1048576'
+  }
 ]
 
 var modelProviderConfigured = !empty(modelProviderSecretName)
@@ -190,6 +266,41 @@ func databaseSecret(identityId string) array => [
     name: 'database-url'
     keyVaultUrl: databaseSecretUrl
     identity: identityId
+  }
+]
+
+// The three shared workload tokens every control-plane service carries in local
+// mode. Azure mode forbids all three; see the platformMode parameter.
+func workloadTokenSecrets(identityId string) array => [
+  {
+    name: 'edge-service-token'
+    keyVaultUrl: edgeServiceTokenSecretUrl
+    identity: identityId
+  }
+  {
+    name: 'runtime-service-token'
+    keyVaultUrl: runtimeServiceTokenSecretUrl
+    identity: identityId
+  }
+  {
+    name: 'runtime-grant-secret'
+    keyVaultUrl: runtimeGrantSecretUrl
+    identity: identityId
+  }
+]
+
+var workloadTokenEnv = [
+  {
+    name: 'EDGE_SERVICE_TOKEN'
+    secretRef: 'edge-service-token'
+  }
+  {
+    name: 'RUNTIME_SERVICE_TOKEN'
+    secretRef: 'runtime-service-token'
+  }
+  {
+    name: 'RUNTIME_GRANT_SECRET'
+    secretRef: 'runtime-grant-secret'
   }
 ]
 
@@ -307,6 +418,7 @@ module gateway 'modules/container-app.bicep' = if (!migrationOnly) {
     maxReplicas: maxReplicas
     secrets: concat(
       databaseSecret(gatewayIdentity.id),
+      workloadTokenSecrets(gatewayIdentity.id),
       [
         {
           name: 'envelope-secret'
@@ -352,6 +464,8 @@ module gateway 'modules/container-app.bicep' = if (!migrationOnly) {
         }
       ],
       caseStoreEnv,
+      platformEnv,
+      workloadTokenEnv,
       telemetryEnv,
       modelProviderConfigured
         ? [
@@ -388,7 +502,17 @@ module caseApi 'modules/container-app.bicep' = if (!migrationOnly) {
     probes: httpProbes(4102)
     minReplicas: minReplicas
     maxReplicas: maxReplicas
-    secrets: databaseSecret(caseApiIdentity.id)
+    secrets: concat(
+      databaseSecret(caseApiIdentity.id),
+      workloadTokenSecrets(caseApiIdentity.id),
+      [
+        {
+          name: 'envelope-secret'
+          keyVaultUrl: envelopeSecretUrl
+          identity: caseApiIdentity.id
+        }
+      ]
+    )
     env: concat(
       [
         {
@@ -404,16 +528,18 @@ module caseApi 'modules/container-app.bicep' = if (!migrationOnly) {
           secretRef: 'database-url'
         }
         {
-          name: 'CASE_ARTIFACT_BACKEND'
-          value: 'postgres'
+          name: 'EXECUTION_ENVELOPE_SECRET'
+          secretRef: 'envelope-secret'
+        }
+        // The outbox sink drains and prunes case events; without it the tables
+        // grow without bound and the transactional outbox is decorative.
+        {
+          name: 'OUTBOX_INTERVAL_MS'
+          value: '5000'
         }
         {
-          name: 'CASE_EVIDENCE_REQUIRE_SCAN'
-          value: 'false'
-        }
-        {
-          name: 'CASE_EVIDENCE_MAX_BYTES'
-          value: '1048576'
+          name: 'OUTBOX_RETENTION_DAYS'
+          value: '7'
         }
         {
           name: 'MODEL_PROFILES_PATH'
@@ -425,6 +551,8 @@ module caseApi 'modules/container-app.bicep' = if (!migrationOnly) {
         }
       ],
       caseStoreEnv,
+      platformEnv,
+      workloadTokenEnv,
       telemetryEnv
     )
   }
@@ -432,6 +560,9 @@ module caseApi 'modules/container-app.bicep' = if (!migrationOnly) {
 
 // ---------------------------------------------------------------------------
 // Control API: plan admission, run commands and queries, authoring lifecycle.
+// Also the envelope broker: the runtime exchanges the dispatcher's grant here
+// for a per-node execution envelope, so the signing secret lives here and not
+// in the runtime.
 // ---------------------------------------------------------------------------
 module controlApi 'modules/container-app.bicep' = if (!migrationOnly) {
   name: 'control-api'
@@ -449,7 +580,17 @@ module controlApi 'modules/container-app.bicep' = if (!migrationOnly) {
     probes: httpProbes(4100)
     minReplicas: minReplicas
     maxReplicas: maxReplicas
-    secrets: databaseSecret(controlApiIdentity.id)
+    secrets: concat(
+      databaseSecret(controlApiIdentity.id),
+      workloadTokenSecrets(controlApiIdentity.id),
+      [
+        {
+          name: 'envelope-secret'
+          keyVaultUrl: envelopeSecretUrl
+          identity: controlApiIdentity.id
+        }
+      ]
+    )
     env: concat(
       [
         {
@@ -472,17 +613,28 @@ module controlApi 'modules/container-app.bicep' = if (!migrationOnly) {
           name: 'TRACE_VIEWER_BASE_URL'
           value: empty(traceViewerPublicUrl) ? urlJaegerQuery : traceViewerPublicUrl
         }
+        {
+          name: 'EXECUTION_ENVELOPE_SECRET'
+          secretRef: 'envelope-secret'
+        }
       ],
       caseStoreEnv,
+      platformEnv,
+      workloadTokenEnv,
       telemetryEnv
     )
   }
 }
 
 // ---------------------------------------------------------------------------
-// Runtime host: lowers the compiled plan into LangGraph. It still needs a
-// database credential for checkpoints and node journaling, which is exactly the
-// dependency AZ-010 removes before execution can move to a Foundry agent.
+// Runtime host: lowers the compiled plan into LangGraph.
+//
+// It holds no envelope signing key and no run-journal credential: it exchanges
+// the dispatcher's grant for a per-node envelope at the control plane and
+// journals through it. The only database handle left is the LangGraph
+// checkpoint store, and RUNTIME_CHECKPOINT_BACKEND=memory removes even that, at
+// the cost of resumability -- which is what a hosted agent outside the trust
+// boundary needs.
 // ---------------------------------------------------------------------------
 module runtimeHost 'modules/container-app.bicep' = if (!migrationOnly) {
   name: 'runtime-host'
@@ -503,16 +655,16 @@ module runtimeHost 'modules/container-app.bicep' = if (!migrationOnly) {
     minReplicas: minReplicas
     maxReplicas: maxReplicas
     secrets: concat(
-      databaseSecret(runtimeHostIdentity.id),
+      runtimeCheckpointBackend == 'postgres' ? databaseSecret(runtimeHostIdentity.id) : [],
       [
-        {
-          name: 'envelope-secret'
-          keyVaultUrl: envelopeSecretUrl
-          identity: runtimeHostIdentity.id
-        }
         {
           name: 'runtime-token'
           keyVaultUrl: runtimeTokenSecretUrl
+          identity: runtimeHostIdentity.id
+        }
+        {
+          name: 'runtime-service-token'
+          keyVaultUrl: runtimeServiceTokenSecretUrl
           identity: runtimeHostIdentity.id
         }
       ]
@@ -524,16 +676,24 @@ module runtimeHost 'modules/container-app.bicep' = if (!migrationOnly) {
           value: '8088'
         }
         {
-          name: 'RUNTIME_CHECKPOINT_DATABASE_URL'
-          secretRef: 'database-url'
+          name: 'RUNTIME_CHECKPOINT_BACKEND'
+          value: runtimeCheckpointBackend
         }
         {
           name: 'RUNTIME_HOST_AUTH_TOKEN'
           secretRef: 'runtime-token'
         }
         {
-          name: 'EXECUTION_ENVELOPE_SECRET'
-          secretRef: 'envelope-secret'
+          name: 'RUNTIME_SERVICE_TOKEN'
+          secretRef: 'runtime-service-token'
+        }
+        {
+          name: 'PLATFORM_MODE'
+          value: platformMode
+        }
+        {
+          name: 'ENVELOPE_BROKER_URL'
+          value: urlControlApi
         }
         {
           name: 'CAPABILITY_GATEWAY_URL'
@@ -544,6 +704,14 @@ module runtimeHost 'modules/container-app.bicep' = if (!migrationOnly) {
           value: urlCaseApi
         }
       ],
+      runtimeCheckpointBackend == 'postgres'
+        ? [
+            {
+              name: 'RUNTIME_CHECKPOINT_DATABASE_URL'
+              secretRef: 'database-url'
+            }
+          ]
+        : [],
       telemetryEnv
     )
   }
@@ -570,12 +738,8 @@ module dispatcher 'modules/container-app.bicep' = if (!migrationOnly) {
     maxReplicas: 1
     secrets: concat(
       databaseSecret(dispatcherIdentity.id),
+      workloadTokenSecrets(dispatcherIdentity.id),
       [
-        {
-          name: 'envelope-secret'
-          keyVaultUrl: envelopeSecretUrl
-          identity: dispatcherIdentity.id
-        }
         {
           name: 'runtime-token'
           keyVaultUrl: runtimeTokenSecretUrl
@@ -592,10 +756,6 @@ module dispatcher 'modules/container-app.bicep' = if (!migrationOnly) {
         {
           name: 'CASE_DATABASE_URL'
           secretRef: 'database-url'
-        }
-        {
-          name: 'EXECUTION_ENVELOPE_SECRET'
-          secretRef: 'envelope-secret'
         }
         {
           name: 'RUNTIME_PROVIDER'
@@ -639,12 +799,27 @@ module dispatcher 'modules/container-app.bicep' = if (!migrationOnly) {
           name: 'WORKER_POLL_MS'
           value: '1000'
         }
+        // Bounded retry with backoff, so a failing node cannot spin the queue.
+        {
+          name: 'WORKER_RETRY_BASE_MS'
+          value: '2000'
+        }
+        {
+          name: 'WORKER_RETRY_MAX_MS'
+          value: '60000'
+        }
+        {
+          name: 'TRACE_VIEWER_BASE_URL'
+          value: empty(traceViewerPublicUrl) ? urlJaegerQuery : traceViewerPublicUrl
+        }
         {
           name: 'MODEL_PROFILES_PATH'
           value: '/app/config/model-profiles.json'
         }
       ],
       caseStoreEnv,
+      platformEnv,
+      workloadTokenEnv,
       telemetryEnv
     )
   }
@@ -670,6 +845,13 @@ module controlUi 'modules/container-app.bicep' = if (!migrationOnly) {
     probes: httpProbes(4200)
     minReplicas: minReplicas
     maxReplicas: maxReplicas
+    secrets: [
+      {
+        name: 'edge-service-token'
+        keyVaultUrl: edgeServiceTokenSecretUrl
+        identity: uiIdentity.id
+      }
+    ]
     env: concat(
       [
         {
@@ -696,6 +878,30 @@ module controlUi 'modules/container-app.bicep' = if (!migrationOnly) {
           name: 'CASE_UI_TENANT_ID'
           value: caseTenantId
         }
+        // The control surface authenticates to the APIs as the edge workload and
+        // forwards the acting principal; it does not mint authority of its own.
+        {
+          name: 'EDGE_SERVICE_TOKEN'
+          secretRef: 'edge-service-token'
+        }
+        // Separation of duties: the author identity cannot approve, so the
+        // approver is a distinct principal with only reader and approver roles.
+        {
+          name: 'CONTROL_UI_ACTOR_ID'
+          value: controlUiActorId
+        }
+        {
+          name: 'CONTROL_UI_ACTOR_ROLES'
+          value: controlUiActorRoles
+        }
+        {
+          name: 'CONTROL_UI_APPROVER_ID'
+          value: controlUiApproverId
+        }
+        {
+          name: 'CONTROL_UI_APPROVER_ROLES'
+          value: controlUiApproverRoles
+        }
         {
           name: 'CONTROL_UI_VERSION'
           value: '0.1.0'
@@ -707,6 +913,10 @@ module controlUi 'modules/container-app.bicep' = if (!migrationOnly) {
         {
           name: 'RUNTIME_PROVIDER'
           value: runtimeProvider
+        }
+        {
+          name: 'FOUNDRY_AGENT_INVOCATION_ENDPOINT'
+          value: foundryAgentInvocationEndpoint
         }
         {
           name: 'FOUNDRY_AGENT_NAME'

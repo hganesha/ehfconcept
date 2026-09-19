@@ -50,18 +50,43 @@ The repository today is the local POC described in `README.md`. This runbook dep
 
 | Gap | Backlog item | Consequence in this deployment |
 | --- | --- | --- |
-| `x-actor-id` defaults to `local-author` in `control-api` | `AZ-002` | Actor identity is not derived from the signed-in user. Entra sign-in gates *access to the UI*, not per-action authorization. |
-| `x-tenant-id` is trusted as sent; `CASE_UI_TENANT_ID` acts as authority | `AZ-002` | Tenant is configuration, not a verified claim. |
-| No `api-edge` BFF; UI is a Next.js **server**, not a static export | `AZ-003`, `AZ-004` | The UI is deployed as a Container App, not Static Web Apps. Internal service URLs stay server-side, which is why the UI container must remain the only externally exposed app. |
-| PostgreSQL uses a password connection string | `AZ-005` | Entra-only database authentication is **not** enabled. The password lives in Key Vault and is injected as a secret reference. |
-| Execution envelope uses a shared HS256 secret | `AZ-006` | No Key Vault RSA signing. The shared secret lives in Key Vault and is injected into the gateway, runtime host, and dispatcher. |
+| PostgreSQL uses a password connection string | `AZ-005` | `packages/persistence` still builds its pool from a connection string. Entra-only database authentication is **not** enabled; the password lives in Key Vault and is injected as a secret reference. |
+| No `api-edge` BFF; UI is a Next.js **server**, not a static export | `AZ-003`, `AZ-004` | The UI is deployed as a Container App, not Static Web Apps. It authenticates to the APIs with a shared edge service token rather than a managed-identity Entra token. |
+| Execution envelopes are signed with a shared HS256 secret | `AZ-006` | The signing key moved out of the runtime — the control plane brokers envelopes now — but it is still a shared secret in Key Vault, not a Key Vault RSA key. |
 | Trace links are Jaeger-specific | `AZ-007` | Jaeger runs as an internal Container App so the UI's trace pages keep working. Application Insights is wired in parallel for platform telemetry. |
-| Runtime host needs `RUNTIME_CHECKPOINT_DATABASE_URL` | `AZ-010` | The runtime host holds database credentials. This is the blocker for moving execution to a Foundry Hosted Agent. |
 | Foundry Hosted Agent wrapper (Invocations protocol) not written | `AZ-011` | `RUNTIME_PROVIDER=azure_foundry` cannot be exercised yet. Part 12 documents the switch and the gate in front of it. |
+
+Two gaps this runbook previously listed are now **closed in the code**, and the
+deployment configures the result:
+
+| Previously listed as missing | Now | What this stamp does |
+| --- | --- | --- |
+| `x-actor-id` defaulted to `local-author`; `x-tenant-id` was trusted as sent | `AZ-001`, `AZ-002` implemented: `packages/identity` resolves a principal, authorizes each action, and every service asserts startup invariants for its platform mode | Runs with `PLATFORM_MODE=local` and `IDENTITY_PROVIDER=local_headers`. The control surface authenticates as the edge workload with a shared token and forwards a principal; separate author and approver principals give a real separation-of-duties demonstration. |
+| The runtime host needed a database credential and signed its own envelopes | `AZ-010` partially implemented: the runtime exchanges the dispatcher's grant for a per-node envelope at the control plane and journals through it | The runtime host holds no signing key and no journal credential. Its only remaining database handle is the LangGraph checkpoint store, and `RUNTIME_CHECKPOINT_BACKEND=memory` removes even that, at the cost of resumability. |
+
+### 0.3 Why this stamp runs in `local` platform mode
+
+The services now refuse to boot in a half-configured state. `PLATFORM_MODE=azure`
+asserts, per service, that:
+
+- `EDGE_SERVICE_TOKEN`, `RUNTIME_SERVICE_TOKEN`, `RUNTIME_GRANT_SECRET`,
+  `EXECUTION_ENVELOPE_SECRET`, `RUNTIME_HOST_AUTH_TOKEN`, and
+  `RUNTIME_CHECKPOINT_DATABASE_URL` are **absent** — managed-identity Entra
+  tokens are meant to replace them;
+- `ENTRA_TENANT_ID`, `ENTRA_API_AUDIENCE`, and `PLATFORM_TENANT_ID` are present;
+- no database URL carries a password or points at a local host.
+
+Those invariants cannot all be satisfied today, because passwordless PostgreSQL
+is still `AZ-005`: a connection string without a password simply fails to
+authenticate. So this stamp deploys with `PLATFORM_MODE=local`, which is a
+deliberate, stated choice rather than an oversight — and the startup invariants
+are the reason you cannot quietly pretend otherwise. When `AZ-005` and the Entra
+workload tokens land, flip `platformMode` in `infra/environments/poc.apps.bicepparam`
+and the services will tell you, loudly, about anything still missing.
 
 Deploy this as a **synthetic-data showcase**. Do not put real customer data in it, and do not present it as the regulated production design. Section 14 of the migration plan lists the production gates.
 
-### 0.3 Prerequisites
+### 0.4 Prerequisites
 
 On your workstation:
 
@@ -82,7 +107,7 @@ In Azure and Entra you need:
 - **Entra directory:** `Application Developer` or `Cloud Application Administrator` — Part 1 creates an app registration and app roles.
 - A region where Container Apps, PostgreSQL Flexible Server, and (optionally) Microsoft Foundry are all available. This runbook uses `eastus2`, matching `docs/implementation/config/foundation.azure.yaml`.
 
-### 0.4 Conventions
+### 0.5 Conventions
 
 - Every command is idempotent-friendly: re-running the runbook against an existing stamp either succeeds or fails loudly. It never silently reuses another environment's resources.
 - Every command targets `$RG`. Nothing is created outside that resource group except the Entra app registration, which is a directory object and has no resource group.
@@ -258,7 +283,15 @@ az rest --method GET \
   --query "value[].{principal:principalDisplayName, role:appRoleId}" -o table
 ```
 
-> **Honest limitation.** These roles appear in the `roles` claim of the token Container Apps validates, but the services in this repository do not yet read that claim (`AZ-002`). Until they do, the roles gate *entry to the control surface*, and every signed-in user has the same authority inside it. Do not demonstrate separation of duties from this deployment.
+> **What these roles do and do not do.** They appear in the `roles` claim of the
+> token Container Apps validates, and they gate entry to the control surface. The
+> services do enforce roles — `packages/identity` authorizes every action — but in
+> `local` identity mode they enforce them against the principals the control
+> surface is configured with (`CONTROL_UI_ACTOR_ID` and `CONTROL_UI_APPROVER_ID`),
+> not against the Entra user who signed in. So separation of duties between author
+> and approver is demonstrable, while per-user authorization is not: every
+> signed-in user acts as the same configured principal. Wiring the token's claim
+> through is the `entra` identity provider plus `AZ-003`/`AZ-004`.
 
 ### 1.4 Create the resource group
 
@@ -485,6 +518,13 @@ The compose defaults (`local-poc-secret-change-before-sharing`, `local-runtime-h
 ```bash
 export EXECUTION_ENVELOPE_SECRET="$(openssl rand -base64 48)"
 export RUNTIME_HOST_AUTH_TOKEN="$(openssl rand -base64 48)"
+
+# Workload credentials for the control plane. The control surface authenticates
+# as the edge workload, the runtime as the runtime workload, and the dispatcher
+# holds the grant it exchanges for per-node execution envelopes.
+export EDGE_SERVICE_TOKEN="$(openssl rand -base64 48)"
+export RUNTIME_SERVICE_TOKEN="$(openssl rand -base64 48)"
+export RUNTIME_GRANT_SECRET="$(openssl rand -base64 48)"
 ```
 
 ### 4.2 Store them in Key Vault
@@ -493,6 +533,9 @@ export RUNTIME_HOST_AUTH_TOKEN="$(openssl rand -base64 48)"
 az keyvault secret set --vault-name "$KV" -n "database-url"              --value "$DATABASE_URL" -o none
 az keyvault secret set --vault-name "$KV" -n "execution-envelope-secret" --value "$EXECUTION_ENVELOPE_SECRET" -o none
 az keyvault secret set --vault-name "$KV" -n "runtime-host-token"        --value "$RUNTIME_HOST_AUTH_TOKEN" -o none
+az keyvault secret set --vault-name "$KV" -n "edge-service-token"        --value "$EDGE_SERVICE_TOKEN" -o none
+az keyvault secret set --vault-name "$KV" -n "runtime-service-token"     --value "$RUNTIME_SERVICE_TOKEN" -o none
+az keyvault secret set --vault-name "$KV" -n "runtime-grant-secret"      --value "$RUNTIME_GRANT_SECRET" -o none
 az keyvault secret set --vault-name "$KV" -n "pg-admin-password"         --value "$PG_ADMIN_PASSWORD" -o none
 az keyvault secret set --vault-name "$KV" -n "entra-client-secret"       --value "$ENTRA_CLIENT_SECRET" -o none
 
@@ -509,6 +552,9 @@ Record the secret reference URIs used by every app definition:
 export SECREF_DB="keyvaultref:${KV_URI}/secrets/database-url"
 export SECREF_ENVELOPE="keyvaultref:${KV_URI}/secrets/execution-envelope-secret"
 export SECREF_RUNTIME_TOKEN="keyvaultref:${KV_URI}/secrets/runtime-host-token"
+export SECREF_EDGE_TOKEN="keyvaultref:${KV_URI}/secrets/edge-service-token"
+export SECREF_RUNTIME_SERVICE="keyvaultref:${KV_URI}/secrets/runtime-service-token"
+export SECREF_GRANT="keyvaultref:${KV_URI}/secrets/runtime-grant-secret"
 export SECREF_ENTRA="keyvaultref:${KV_URI}/secrets/entra-client-secret"
 ```
 
@@ -669,6 +715,27 @@ Common values used by all of them:
 
 ```bash
 export COMMON_OTEL="OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${URL_JAEGER_OTLP} OTEL_TRACES_SAMPLER_ARG=1 DEPLOYMENT_ENVIRONMENT=${ENVNAME} CLOUD_REGION=${LOC}"
+
+# Platform mode and the local identity provider. See section 0.3 for why this is
+# `local` rather than `azure`.
+export COMMON_PLATFORM="PLATFORM_MODE=local IDENTITY_PROVIDER=local_headers LOCAL_DEFAULT_TENANT_ID=tenant_demo"
+
+# Case-store knobs, set on every service exactly as the compose anchor does.
+export COMMON_CASE="CASE_CORE_SCHEMA=case_core CASE_LEDGER_SCHEMA=case_ledger EVIDENCE_SCHEMA=evidence CASE_ARTIFACT_BACKEND=postgres CASE_EVIDENCE_REQUIRE_SCAN=false CASE_EVIDENCE_MAX_BYTES=1048576"
+
+# The three shared workload tokens, referenced from Key Vault by every
+# control-plane service.
+export COMMON_TOKENS="EDGE_SERVICE_TOKEN=secretref:edge-service-token RUNTIME_SERVICE_TOKEN=secretref:runtime-service-token RUNTIME_GRANT_SECRET=secretref:runtime-grant-secret"
+
+# A Key Vault reference is resolved by the app's own managed identity, so each
+# service needs its own identityref on the same three secrets.
+token_secrets() {
+  local mi="$1"
+  printf '%s %s %s' \
+    "edge-service-token=${SECREF_EDGE_TOKEN},identityref:${mi}" \
+    "runtime-service-token=${SECREF_RUNTIME_SERVICE},identityref:${mi}" \
+    "runtime-grant-secret=${SECREF_GRANT},identityref:${mi}"
+}
 ```
 
 ### 8.1 Jaeger (trace sink and query API)
@@ -701,6 +768,7 @@ az containerapp create -g "$RG" -n "$APP_GATEWAY" --environment "$CAE" \
   --min-replicas 1 --max-replicas 3 --cpu 1 --memory 2Gi \
   --secrets "database-url=${SECREF_DB},identityref:${MI_GATEWAY_ID}" \
             "envelope-secret=${SECREF_ENVELOPE},identityref:${MI_GATEWAY_ID}" \
+            $(token_secrets "$MI_GATEWAY_ID") \
   --env-vars \
     "GATEWAY_PORT=4101" \
     "DATABASE_URL=secretref:database-url" \
@@ -708,7 +776,7 @@ az containerapp create -g "$RG" -n "$APP_GATEWAY" --environment "$CAE" \
     "EXECUTION_ENVELOPE_SECRET=secretref:envelope-secret" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
-    $COMMON_OTEL \
+    $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
   --command "/bin/sh" --args "-c" "pnpm --filter @ehf/capability-gateway start" \
   --tags $TAGS
 ```
@@ -736,19 +804,18 @@ az containerapp create -g "$RG" -n "$APP_CASE_API" --environment "$CAE" \
   --ingress internal --target-port 4102 --transport auto \
   --min-replicas 1 --max-replicas 3 --cpu 1 --memory 2Gi \
   --secrets "database-url=${SECREF_DB},identityref:${MI_CASE_API_ID}" \
+            "envelope-secret=${SECREF_ENVELOPE},identityref:${MI_CASE_API_ID}" \
+            $(token_secrets "$MI_CASE_API_ID") \
   --env-vars \
     "CASE_API_PORT=4102" \
     "DATABASE_URL=secretref:database-url" \
     "CASE_DATABASE_URL=secretref:database-url" \
-    "CASE_CORE_SCHEMA=case_core" \
-    "CASE_LEDGER_SCHEMA=case_ledger" \
-    "EVIDENCE_SCHEMA=evidence" \
-    "CASE_ARTIFACT_BACKEND=postgres" \
-    "CASE_EVIDENCE_REQUIRE_SCAN=false" \
-    "CASE_EVIDENCE_MAX_BYTES=1048576" \
+    "EXECUTION_ENVELOPE_SECRET=secretref:envelope-secret" \
+    "OUTBOX_INTERVAL_MS=5000" \
+    "OUTBOX_RETENTION_DAYS=7" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
-    $COMMON_OTEL \
+    $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
   --command "/bin/sh" --args "-c" "pnpm --filter @ehf/case-api start" \
   --tags $TAGS
 ```
@@ -756,6 +823,11 @@ az containerapp create -g "$RG" -n "$APP_CASE_API" --environment "$CAE" \
 `CASE_ARTIFACT_BACKEND=postgres` keeps evidence bytes in the database. The Blob adapter is `AZ-013` and is not implemented.
 
 ### 8.4 Control API
+
+The control API is also the envelope broker: the runtime exchanges the
+dispatcher's grant here for a per-node execution envelope, and journals its node
+transitions through it. That is why the signing secret lives here rather than in
+the runtime.
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_CONTROL_API" --environment "$CAE" \
@@ -765,20 +837,26 @@ az containerapp create -g "$RG" -n "$APP_CONTROL_API" --environment "$CAE" \
   --ingress internal --target-port 4100 --transport auto \
   --min-replicas 1 --max-replicas 3 --cpu 1 --memory 2Gi \
   --secrets "database-url=${SECREF_DB},identityref:${MI_CONTROL_API_ID}" \
+            "envelope-secret=${SECREF_ENVELOPE},identityref:${MI_CONTROL_API_ID}" \
+            $(token_secrets "$MI_CONTROL_API_ID") \
   --env-vars \
     "CONTROL_API_PORT=4100" \
     "DATABASE_URL=secretref:database-url" \
     "CASE_DATABASE_URL=secretref:database-url" \
+    "EXECUTION_ENVELOPE_SECRET=secretref:envelope-secret" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
     "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
-    $COMMON_OTEL \
+    $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
   --command "/bin/sh" --args "-c" "pnpm --filter @ehf/control-api start" \
   --tags $TAGS
 ```
 
 ### 8.5 Runtime host
 
-Executes the compiled LangGraph plan. It needs the envelope secret, the shared runtime token, and — until `AZ-010` lands — direct database access for checkpoints.
+Executes the compiled LangGraph plan. It holds **no** envelope signing key and
+**no** run-journal credential: it exchanges the dispatcher's grant for a per-node
+envelope at the control plane and journals through it. Its only remaining
+database handle is the LangGraph checkpoint store.
 
 ```bash
 az containerapp create -g "$RG" -n "$APP_RUNTIME_HOST" --environment "$CAE" \
@@ -788,13 +866,16 @@ az containerapp create -g "$RG" -n "$APP_RUNTIME_HOST" --environment "$CAE" \
   --ingress internal --target-port 8088 --transport auto \
   --min-replicas 1 --max-replicas 3 --cpu 1 --memory 2Gi \
   --secrets "database-url=${SECREF_DB},identityref:${MI_RUNTIME_HOST_ID}" \
-            "envelope-secret=${SECREF_ENVELOPE},identityref:${MI_RUNTIME_HOST_ID}" \
             "runtime-token=${SECREF_RUNTIME_TOKEN},identityref:${MI_RUNTIME_HOST_ID}" \
+            "runtime-service-token=${SECREF_RUNTIME_SERVICE},identityref:${MI_RUNTIME_HOST_ID}" \
   --env-vars \
     "RUNTIME_HOST_PORT=8088" \
+    "RUNTIME_CHECKPOINT_BACKEND=postgres" \
     "RUNTIME_CHECKPOINT_DATABASE_URL=secretref:database-url" \
     "RUNTIME_HOST_AUTH_TOKEN=secretref:runtime-token" \
-    "EXECUTION_ENVELOPE_SECRET=secretref:envelope-secret" \
+    "RUNTIME_SERVICE_TOKEN=secretref:runtime-service-token" \
+    "PLATFORM_MODE=local" \
+    "ENVELOPE_BROKER_URL=${URL_CONTROL_API}" \
     "CAPABILITY_GATEWAY_URL=${URL_GATEWAY}" \
     "CASE_API_URL=${URL_CASE_API}" \
     $COMMON_OTEL \
@@ -803,6 +884,13 @@ az containerapp create -g "$RG" -n "$APP_RUNTIME_HOST" --environment "$CAE" \
 ```
 
 The command invokes the checked-in `tsx` binary directly, matching the Compose definition, so the container never asks pnpm to relink the workspace at startup.
+
+To remove the runtime's last database credential entirely, set
+`RUNTIME_CHECKPOINT_BACKEND=memory` and drop the `database-url` secret and
+`RUNTIME_CHECKPOINT_DATABASE_URL` from the block above. Runs stop being resumable
+across a restart, which is the trade a hosted agent outside the platform's trust
+boundary has to make. `infra/apps.bicep` exposes this as `runtimeCheckpointBackend`
+and drops the secret automatically.
 
 ### 8.6 Runtime dispatcher
 
@@ -815,19 +903,21 @@ az containerapp create -g "$RG" -n "$APP_DISPATCHER" --environment "$CAE" \
   --user-assigned "$MI_DISPATCHER_ID" \
   --min-replicas 1 --max-replicas 1 --cpu 1 --memory 2Gi \
   --secrets "database-url=${SECREF_DB},identityref:${MI_DISPATCHER_ID}" \
-            "envelope-secret=${SECREF_ENVELOPE},identityref:${MI_DISPATCHER_ID}" \
             "runtime-token=${SECREF_RUNTIME_TOKEN},identityref:${MI_DISPATCHER_ID}" \
+            $(token_secrets "$MI_DISPATCHER_ID") \
   --env-vars \
     "DATABASE_URL=secretref:database-url" \
     "CASE_DATABASE_URL=secretref:database-url" \
-    "EXECUTION_ENVELOPE_SECRET=secretref:envelope-secret" \
     "RUNTIME_PROVIDER=local_http" \
     "RUNTIME_LOCAL_ENDPOINT=${URL_RUNTIME_HOST}/invocations" \
     "RUNTIME_HOST_AUTH_TOKEN=secretref:runtime-token" \
     "WORKER_LEASE_SECONDS=60" \
     "WORKER_POLL_MS=1000" \
+    "WORKER_RETRY_BASE_MS=2000" \
+    "WORKER_RETRY_MAX_MS=60000" \
+    "TRACE_VIEWER_BASE_URL=${URL_JAEGER_QUERY}" \
     "MODEL_PROFILES_PATH=/app/config/model-profiles.json" \
-    $COMMON_OTEL \
+    $COMMON_PLATFORM $COMMON_CASE $COMMON_TOKENS $COMMON_OTEL \
   --command "/bin/sh" --args "-c" "pnpm --filter @ehf/runtime-worker start" \
   --tags $TAGS
 ```
@@ -863,12 +953,18 @@ az containerapp create -g "$RG" -n "$APP_UI" --environment "$CAE" \
   --user-assigned "$MI_UI_ID" \
   --ingress external --target-port 4200 --transport auto \
   --min-replicas 1 --max-replicas 3 --cpu 1 --memory 2Gi \
+  --secrets "edge-service-token=${SECREF_EDGE_TOKEN},identityref:${MI_UI_ID}" \
   --env-vars \
     "CONTROL_API_INTERNAL_URL=${URL_CONTROL_API}" \
     "CAPABILITY_GATEWAY_INTERNAL_URL=${URL_GATEWAY}" \
     "CASE_API_INTERNAL_URL=${URL_CASE_API}" \
     "JAEGER_API_INTERNAL_URL=${URL_JAEGER_QUERY}" \
     "CASE_UI_TENANT_ID=tenant_demo" \
+    "EDGE_SERVICE_TOKEN=secretref:edge-service-token" \
+    "CONTROL_UI_ACTOR_ID=local-author" \
+    "CONTROL_UI_ACTOR_ROLES=Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer" \
+    "CONTROL_UI_APPROVER_ID=local-approver" \
+    "CONTROL_UI_APPROVER_ROLES=Harness.Reader,Harness.Approver" \
     "CONTROL_UI_VERSION=0.1.0" \
     "RUNTIME_PROVIDER=local_http" \
     "BUILD_COMMIT_SHA=${SOURCE_REVISION}" \
@@ -916,7 +1012,15 @@ curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" "https://${UI_FQDN}/"
 
 Then open `https://${UI_FQDN}` in a browser, sign in as one of the users assigned in step 1.3, and confirm the Cases, Runs, and Author pages load.
 
-> Sign-in is the boundary. The services behind it still read `x-actor-id` and `x-tenant-id` as supplied (`AZ-002`), so every signed-in user acts with the same authority. Say this plainly in any demo.
+> Sign-in is the outer boundary, and it is not the same thing as per-user
+> authorization. The services now resolve a principal and authorize each action
+> (`packages/identity`), but in `local` identity mode the control surface
+> authenticates as the edge workload and presents the principals configured in
+> `CONTROL_UI_ACTOR_ID` and `CONTROL_UI_APPROVER_ID` — not the Entra user who
+> signed in. So separation of duties between author and approver is real and
+> demonstrable, while *which human* is acting is not yet carried from the token.
+> Closing that is the `entra` identity provider plus `AZ-003`/`AZ-004`. Say it
+> that precisely in a demo.
 
 ### 9.4 (Optional) Reach the Jaeger UI
 
@@ -1162,9 +1266,13 @@ Key Vault has purge protection enabled, so the vault name stays reserved for the
 
 ## Part 12 — Optional: switch execution to a Foundry Hosted Agent
 
-> **Gate.** This path is documented, not runnable from the current repository. `README.md` states that the Azure Hosted Agent "still needs the documented Invocations-protocol wrapper and deployment/promotion steps." `packages/runtime-provider` already implements `AzureFoundryRuntimeProvider` (Entra token, `https://ai.azure.com/.default`, immutable agent name/version, execution-profile digest), so the dispatcher side is ready; the agent-side container contract is `AZ-011`, and removing the runtime host's database credential is `AZ-010`. Complete both before running this part.
+> **Gate.** This path is documented, not runnable from the current repository. `README.md` states that the Azure Hosted Agent "still needs the documented Invocations-protocol wrapper and deployment/promotion steps." `packages/runtime-provider` already implements `AzureFoundryRuntimeProvider` (Entra token, `https://ai.azure.com/.default`, immutable agent name/version, execution-profile digest), so the dispatcher side is ready. The blocker is now only the agent-side
+> container contract (`AZ-011`): the runtime already holds no signing key and no
+> journal credential, and `RUNTIME_CHECKPOINT_BACKEND=memory` removes its last
+> database handle, so a hosted agent can run with no data credential at all —
+> at the cost of resumability across a restart.
 
-Once those land:
+Once that wrapper exists:
 
 1. Create the Foundry project and record its endpoint.
 
@@ -1202,6 +1310,7 @@ Once those land:
 
 6. Re-run the provider conformance set before claiming parity: invoke, duplicate invocation, timeout, cancellation, stale fencing epoch, gateway denial, and trace propagation. The same compiled plan must succeed under both `local_http` and `azure_foundry`.
 7. Keep `ca-hf-runtime-host` deployed until the Foundry path passes; reverting is a single `RUNTIME_PROVIDER` change back to `local_http`.
+8. Deploy the hosted agent with `RUNTIME_CHECKPOINT_BACKEND=memory` so it carries no database credential across the trust boundary, and treat non-resumability as a known limitation of that deployment rather than a defect.
 
 Grant the Foundry-created agent identity only capability-gateway access. It gets no PostgreSQL, Key Vault, or direct model role.
 
@@ -1214,94 +1323,31 @@ What a reviewer may be told this deployment proves:
 - the full harness stack runs on Azure managed services in an isolated resource group;
 - images are immutable and digest-pinned, built in ACR, pulled with per-service managed identities and no registry credential;
 - every business service is private to the Container Apps environment; only the control surface is public;
-- the control surface is behind Microsoft Entra sign-in with assigned app roles;
+- the control surface is behind Microsoft Entra sign-in;
 - platform secrets live in Key Vault and are resolved by per-service identity at revision start, never passed in a template;
 - the database is VNet-injected with private DNS and no public endpoint;
+- every service resolves a principal and authorizes each action, and refuses to
+  boot if its platform mode and configuration disagree;
+- author and approver are distinct principals, so publication cannot be
+  self-approved;
+- the runtime holds no envelope signing key and no run-journal credential: it
+  exchanges the dispatcher's grant for a per-node envelope at the control plane;
 - the compiled plan → admission → dispatch → execution → capability gateway → canonical case commit path works end to end, with traces correlated across services.
 
 What it does **not** prove, and must not be claimed:
 
 | Claim to avoid | Why | Closes with |
 | --- | --- | --- |
-| "Per-user authorization is enforced" | `x-actor-id` still defaults to `local-author`; app roles are not read by the services | `AZ-002` |
-| "Tenant isolation is enforced" | `x-tenant-id` and `CASE_UI_TENANT_ID` are configuration, not verified claims | `AZ-002` |
-| "Passwordless database access" | Services authenticate with an administrator password from Key Vault; Entra-only auth is off | `AZ-005` |
+| "The signed-in user's identity drives authorization" | In `local` identity mode the control surface presents configured principals, not the Entra user from the token | `entra` identity provider, `AZ-003`, `AZ-004` |
+| "Passwordless database access" | Services authenticate with an administrator password from Key Vault; `packages/persistence` has no managed-identity path | `AZ-005` |
 | "Per-identity database privileges" | All services share one database principal | `AZ-005` |
-| "Hardware-backed execution signing" | Execution envelopes use a shared HS256 secret | `AZ-006` |
-| "The runtime holds no data credentials" | The runtime host still needs `RUNTIME_CHECKPOINT_DATABASE_URL` | `AZ-010` |
+| "Hardware-backed execution signing" | Envelopes are brokered by the control plane but still signed with a shared HS256 secret | `AZ-006` |
+| "Workload-to-workload calls use Entra tokens" | Services authenticate to each other with shared tokens from Key Vault | `AZ-002` azure mode |
+| "This is Azure platform mode" | The stamp runs `PLATFORM_MODE=local`; azure mode's invariants cannot be satisfied until the above land, and the services enforce that | `AZ-005`, `AZ-006` |
+| "The runtime holds no data credential" | `RUNTIME_CHECKPOINT_BACKEND=postgres` keeps one checkpoint handle; `memory` removes it at the cost of resumability | `AZ-010` remainder |
 | "Execution runs in Foundry" | `RUNTIME_PROVIDER=local_http`; the hosted-agent wrapper is unwritten | `AZ-011` |
 | "Azure-native observability" | Harness spans go to an in-memory Jaeger container; App Insights carries platform telemetry only | `AZ-007` |
 | "Production-ready" | See section 14 of the migration plan: DR, key rotation, egress control, pen test, WORM retention, quota validation | — |
-
----
-
-## Part 14 — Automating this runbook
-
-Everything in parts 2 through 8 is also available as infrastructure as code in
-[`infra/`](../../infra/README.md), with GitHub Actions workflows in
-[`.github/workflows/`](../../.github/workflows). Those close `AZ-008` and
-`AZ-009` in the migration plan. This part is the map between the two.
-
-### Which parts are automated
-
-| Runbook part | Automated by | Notes |
-| --- | --- | --- |
-| 1.1–1.3 Entra app, app roles, user assignment | — | Directory objects; ARM cannot create them. Stays manual. |
-| 1.4 Resource group | — | Created once; the deployment identity is scoped to it. |
-| 1.5 Workload identities | `infra/main.bicep` | One per workload, same names. |
-| 1.6 GitHub OIDC identity | — | Bootstrap once, then the workflows use it. |
-| 2.1–2.4 Network, ACR, monitoring, Key Vault | `infra/main.bicep` | |
-| 2.5 PostgreSQL | `infra/database.bicep` | Reads its password from the vault. |
-| 3 Role assignments | `infra/modules/rbac.bicep` | |
-| 4 Secrets | `scripts/azure/seed-secrets.sh` | Generates only what is absent; never rotates in place. |
-| 5 Images | `.github/workflows/build-images.yml` | Digests plus a release manifest. |
-| 6 Container Apps environment | `infra/main.bicep` | |
-| 7 Migrations | `.github/workflows/deploy-apps.yml` | Runs to completion before services roll. |
-| 8 Backend services | `infra/apps.bicep` | Same env blocks as part 8. |
-| 9.1 Control surface | `infra/apps.bicep` | |
-| 9.2–9.3 Redirect URI and sign-in | — | Needs the FQDN the deployment produces. Stays manual. |
-| 10 Smoke tests | partly, `scripts/azure/smoke.sh` | Shape checks only; see below. |
-| 11.2 Rollout | `.github/workflows/deploy-apps.yml` | |
-
-### Two things the automation deliberately does not do
-
-**It does not create identity objects.** The Entra app registration, its app
-roles, the user assignments, the federated credential, and Container Apps
-built-in authentication are provisioned by parts 1.3, 1.6, and 9.2–9.3. The
-migration plan's rule is the reason: provision directory objects with a
-documented idempotent bootstrap and feed their IDs in as parameters, rather than
-hiding manually created identity objects behind undocumented template
-parameters.
-
-**It does not run the behavioural smoke tests.** `scripts/azure/smoke.sh`
-asserts the shape of the deployment — every app provisioned and healthy, the
-dispatcher never scaled to zero, exactly one public app, migrations succeeded,
-anonymous access refused. Admitting a plan and executing a run requires reaching
-the private control API, which means opening an ingress window; part 10 does
-that interactively and closes it immediately. A scheduled workflow that opened a
-hole in the network to test itself would be a worse trade than running part 10
-by hand after a release.
-
-### Resource names differ between the two paths
-
-The CLI commands in part 1.2 derive globally unique names from your subscription
-ID. The templates derive them from `uniqueString(resourceGroup().id)`, because a
-template cannot read your shell. Both are deterministic and both are stable, but
-they do not produce the same names.
-
-Pick one path per stamp. To point the templates at a stamp you built by hand,
-pass the existing names instead:
-
-```bash
-export REGISTRY_NAME="$ACR" KEY_VAULT_NAME="$KV" POSTGRES_SERVER_NAME="$PG"
-az deployment group create -g "$RG" -f infra/main.bicep \
-  -p infra/environments/poc.bicepparam
-```
-
-The parameter file reads those three from the environment, so the deployment
-still has exactly one parameter source.
-
-Container app, job, and identity names are already identical in both paths.
 
 ---
 

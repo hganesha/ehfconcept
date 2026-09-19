@@ -45,6 +45,20 @@ param migrationOnly = bool(readEnvironmentVariable('MIGRATION_ONLY', 'false'))
 param databaseSecretName = 'database-url'
 param envelopeSecretName = 'execution-envelope-secret'
 param runtimeTokenSecretName = 'runtime-host-token'
+param edgeServiceTokenSecretName = 'edge-service-token'
+param runtimeServiceTokenSecretName = 'runtime-service-token'
+param runtimeGrantSecretName = 'runtime-grant-secret'
+
+// The services assert startup invariants for this mode. azure forbids every
+// shared token above and requires a passwordless database URL, which is not
+// possible until packages/persistence authenticates with a managed identity
+// (AZ-005). Keep local until then; see the runbook's gap register.
+param platformMode = readEnvironmentVariable('PLATFORM_MODE', 'local')
+param identityProvider = readEnvironmentVariable('IDENTITY_PROVIDER', 'local_headers')
+
+// postgres keeps runs resumable; memory lets the runtime hold no database
+// credential at all, which is what a hosted agent needs.
+param runtimeCheckpointBackend = readEnvironmentVariable('RUNTIME_CHECKPOINT_BACKEND', 'postgres')
 
 // Leave empty to run the deterministic recorded model adapter. Set to
 // 'openrouter-api-key' after seeding that secret to call a live provider.

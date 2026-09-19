@@ -30,6 +30,10 @@ permissions:
 jobs:
   smoke:
     name: verify stamp
+    # Without a configured identity there is no stamp to verify. A scheduled
+    # workflow that fails every morning because it was never pointed at a
+    # subscription trains people to ignore it.
+    if: vars.AZURE_CLIENT_ID != ''
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'poc' }}
     steps:

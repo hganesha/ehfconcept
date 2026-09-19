@@ -43,6 +43,13 @@ ensure_secret "pg-admin-password" generate_password
 ensure_secret "execution-envelope-secret" generate_token
 ensure_secret "runtime-host-token" generate_token
 
+# Workload credentials for the control plane. The services refuse to start with
+# these present when PLATFORM_MODE=azure, because managed-identity Entra tokens
+# are meant to replace them; this stamp runs in local mode, so they are seeded.
+ensure_secret "edge-service-token" generate_token
+ensure_secret "runtime-service-token" generate_token
+ensure_secret "runtime-grant-secret" generate_token
+
 echo
 echo "Secrets in ${vault}:"
 az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv | sed 's/^/  /'
