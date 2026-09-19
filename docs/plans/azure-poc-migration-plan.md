@@ -4,6 +4,7 @@
 **Scope:** showcase deployment, synthetic data only
 **Baseline:** repository state on 17 September 2026
 **Target:** Azure Static Web Apps, Azure Container Apps, Azure Database for PostgreSQL Flexible Server, and the existing Microsoft Foundry Hosted Agent runtime
+**Executable runbook for today's code:** [Azure deployment runbook](../deploy/azure-deployment-runbook.md)
 
 ## 1. Executive decision
 
