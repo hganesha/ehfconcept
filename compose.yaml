@@ -35,15 +35,13 @@ services:
     <<: *service-hardening
     build:
       context: .
-      args:
-        SERVICE_FILTER: "@ehf/persistence..."
-        SERVICE_FILTER_2: "@ehf/case-store..."
-    command:
-      - sh
-      - -c
-      - ./packages/persistence/node_modules/.bin/tsx packages/persistence/src/migrate.ts && ./packages/case-store/node_modules/.bin/tsx packages/case-store/src/migrate.ts
+      dockerfile: Dockerfile.migrate
     environment: &runtime-env
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
+      DB_POOL_MAX: ${DB_POOL_MAX:-5}
+      DB_CONNECT_TIMEOUT_MS: ${DB_CONNECT_TIMEOUT_MS:-5000}
+      DB_IDLE_TIMEOUT_MS: ${DB_IDLE_TIMEOUT_MS:-30000}
+      RUN_QUEUE_MAX_PENDING: ${RUN_QUEUE_MAX_PENDING:-10000}
       MODEL_PROFILES_PATH: /app/config/model-profiles.json
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
       OTEL_TRACES_SAMPLER_ARG: "1"
@@ -74,10 +72,10 @@ services:
     build:
       context: .
       args:
-        SERVICE_FILTER: "@ehf/control-api..."
-    command: ./apps/control-api/node_modules/.bin/tsx apps/control-api/src/server.ts
+        SERVICE_NAME: control-api
     environment:
       <<: *runtime-env
+      DB_POOL_MAX: ${CONTROL_API_DB_POOL_MAX:-5}
       CONTROL_API_PORT: "4100"
       EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
     ports:
@@ -96,13 +94,13 @@ services:
     build:
       context: .
       args:
-        SERVICE_FILTER: "@ehf/capability-gateway..."
-    command: ./apps/capability-gateway/node_modules/.bin/tsx apps/capability-gateway/src/server.ts
+        SERVICE_NAME: capability-gateway
     env_file:
       - path: .env.local
         required: false
     environment:
       <<: *runtime-env
+      DB_POOL_MAX: ${GATEWAY_DB_POOL_MAX:-5}
       GATEWAY_PORT: "4101"
       EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
     ports:
@@ -121,10 +119,10 @@ services:
     build:
       context: .
       args:
-        SERVICE_FILTER: "@ehf/case-api..."
-    command: ./apps/case-api/node_modules/.bin/tsx apps/case-api/src/server.ts
+        SERVICE_NAME: case-api
     environment:
       <<: *runtime-env
+      DB_POOL_MAX: ${CASE_API_DB_POOL_MAX:-5}
       CASE_API_PORT: "4102"
       EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
       OUTBOX_INTERVAL_MS: ${OUTBOX_INTERVAL_MS:-5000}
@@ -147,14 +145,13 @@ services:
     build:
       context: .
       args:
-        SERVICE_FILTER: "@ehf/runtime-host..."
+        SERVICE_NAME: runtime-host
     # Holds no envelope signing key and no run journal credential: it exchanges the
     # dispatcher's grant for a per-node envelope at the control plane, and journals
     # through it too. The only database handle left is the LangGraph checkpoint store,
     # which RUNTIME_CHECKPOINT_BACKEND=memory removes entirely at the cost of resumability.
     # Invoke the checked-in runtime directly so the read-only container never
     # asks pnpm to repair or relink the workspace at startup.
-    command: ./apps/runtime-host/node_modules/.bin/tsx apps/runtime-host/src/server.ts
     environment:
       RUNTIME_CHECKPOINT_BACKEND: ${RUNTIME_CHECKPOINT_BACKEND:-postgres}
       RUNTIME_CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
@@ -191,10 +188,10 @@ services:
     build:
       context: .
       args:
-        SERVICE_FILTER: "@ehf/runtime-worker..."
-    command: ./apps/runtime-worker/node_modules/.bin/tsx apps/runtime-worker/src/worker.ts
+        SERVICE_NAME: runtime-worker
     environment:
       <<: *runtime-env
+      DB_POOL_MAX: ${WORKER_DB_POOL_MAX:-5}
       RUNTIME_PROVIDER: ${RUNTIME_PROVIDER:-local_http}
       RUNTIME_LOCAL_ENDPOINT: http://runtime-host-local:8088/invocations
       RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
@@ -205,6 +202,7 @@ services:
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
       WORKER_LEASE_SECONDS: "60"
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      WORKER_METRICS_PORT: "9090"
       WORKER_RETRY_BASE_MS: ${WORKER_RETRY_BASE_MS:-2000}
       WORKER_RETRY_MAX_MS: ${WORKER_RETRY_MAX_MS:-60000}
       RUNTIME_GRANT_SECRET: ${RUNTIME_GRANT_SECRET:-local-runtime-grant-secret-change-before-share}
@@ -215,6 +213,11 @@ services:
         condition: service_healthy
       jaeger:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9090/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   control-ui:
     <<: *service-hardening

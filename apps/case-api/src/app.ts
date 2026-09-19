@@ -5,8 +5,8 @@ import {
   createKycCase,
   getCaseView,
   getEvidence,
-  listCaseEvents,
-  listCases,
+  listCaseEventsPage,
+  listCasesPage,
   registerEvidence,
   submitBusinessCommand,
   verifyCaseLedger,
@@ -142,17 +142,17 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
     return reply.code(result.created ? 201 : 200).send(result);
   }));
 
-  app.get<{ Querystring: { status?: string; limit?: string } }>("/v1/cases", async (request, reply) => traced(request, "case.list", {}, async () => {
+  app.get<{ Querystring: { status?: string; limit?: string; cursor?: string } }>("/v1/cases", async (request, reply) => traced(request, "case.list", {}, async () => {
     const tenant = (await authorize(request, "case.read", { kind: "case" })).tenantId;
     const status = request.query.status ? kycCaseStatusSchema.safeParse(request.query.status) : null;
     if (status && !status.success) return reply.code(400).send({ error: "case.status_invalid" });
-    return {
-      cases: await listCases(store, {
+    const page = await listCasesPage(store, {
         tenantId: tenant,
         ...(status?.success ? { status: status.data } : {}),
         ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
-      }),
-    };
+        ...(request.query.cursor ? { cursor: request.query.cursor } : {}),
+    });
+    return { cases: page.items, nextCursor: page.nextCursor };
   }));
 
   app.get<{ Params: { caseId: string } }>("/v1/cases/:caseId", async (request, reply) => traced(request, "case.read", {
@@ -184,11 +184,15 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
     return reply.code(200).send(result);
   }));
 
-  app.get<{ Params: { caseId: string }; Querystring: { after?: string } }>("/v1/cases/:caseId/events", async (request) => traced(request, "case.events.read", {
+  app.get<{ Params: { caseId: string }; Querystring: { after?: string; limit?: string } }>("/v1/cases/:caseId/events", async (request) => traced(request, "case.events.read", {
     "case.id": request.params.caseId,
   }, async () => {
     const principal = await authorize(request, "event.read", { kind: "case", id: request.params.caseId });
-    return { events: await listCaseEvents(store, principal.tenantId, request.params.caseId, Number(request.query.after ?? 0)) };
+    const page = await listCaseEventsPage(store, principal.tenantId, request.params.caseId, {
+      afterSequence: Number(request.query.after ?? 0),
+      ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
+    });
+    return { events: page.items, nextCursor: page.nextCursor };
   }));
 
   app.post<{ Params: { caseId: string } }>("/v1/cases/:caseId/ledger:verify", async (request) => traced(request, "case.ledger.verify", {

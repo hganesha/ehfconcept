@@ -9,9 +9,11 @@
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
+    "build:service": "node scripts/build-service.mjs",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "check": "pnpm typecheck && pnpm test && pnpm build",
+    "perf": "node scripts/performance.mjs",
     "db:migrate": "pnpm --filter @ehf/persistence migrate && pnpm --filter @ehf/case-store migrate",
     "dev:api": "pnpm --filter @ehf/control-api dev",
     "dev:gateway": "pnpm --filter @ehf/capability-gateway dev",
@@ -22,6 +24,7 @@
   },
   "devDependencies": {
     "@types/node": "26.0.1",
+    "esbuild": "0.25.10",
     "tsx": "4.23.1",
     "typescript": "5.9.3",
     "vitest": "4.1.11"

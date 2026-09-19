@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createDemoKycCase, listCaseSummaries } from "@/lib/runtime-service";
+import { createDemoKycCase, listCaseSummariesPage } from "@/lib/runtime-service";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest) {
   try {
-    const items = await listCaseSummaries({
+    const page = await listCaseSummariesPage({
       query: request.nextUrl.searchParams.get("query") ?? undefined,
       status: request.nextUrl.searchParams.get("status") ?? undefined,
+      cursor: request.nextUrl.searchParams.get("cursor") ?? undefined,
+      limit: request.nextUrl.searchParams.get("limit") ? Number(request.nextUrl.searchParams.get("limit")) : undefined,
     });
-    return NextResponse.json({ items, generatedAt: new Date().toISOString() });
+    return NextResponse.json({ items: page.items, nextCursor: page.nextCursor, generatedAt: new Date().toISOString() });
   } catch (error) {
     return NextResponse.json(
       { error: "CASES_QUERY_FAILED", message: error instanceof Error ? error.message : "Unknown error" },

@@ -78,6 +78,7 @@ async function authenticatedTenantId(): Promise<string> {
 }
 
 type JsonMap = Record<string, unknown>;
+export type CursorPage<T> = { items: T[]; nextCursor: string | null };
 type RawPlan = {
   apiVersion: string;
   kind: "HarnessPlan";
@@ -314,13 +315,32 @@ function mapPlan(raw: RawPlan, admittedAt: string): CompiledHarnessPlan {
   };
 }
 
+async function planRecordsPage(cursor?: string, limit = 100): Promise<CursorPage<{ raw: RawPlan; plan: CompiledHarnessPlan }>> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  const response = await apiJson<{ records: { plan: RawPlan; admittedAt: string }[]; nextCursor: string | null }>(
+    controlBase, `/v1/plan-records?${params}`,
+  );
+  return {
+    items: response.records.map((record) => ({ raw: record.plan, plan: mapPlan(record.plan, record.admittedAt) })),
+    nextCursor: response.nextCursor,
+  };
+}
+
 async function planRecords(): Promise<{ raw: RawPlan; plan: CompiledHarnessPlan }[]> {
-  const response = await apiJson<{ records: { plan: RawPlan; admittedAt: string }[] }>(controlBase, "/v1/plan-records");
-  return response.records.map((record) => ({ raw: record.plan, plan: mapPlan(record.plan, record.admittedAt) }));
+  return (await planRecordsPage()).items;
+}
+
+async function rawRunsPage(cursor?: string, limit = 100, planDigest?: string): Promise<CursorPage<RawRun>> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  if (planDigest) params.set("planDigest", planDigest);
+  const response = await apiJson<{ runs: RawRun[]; nextCursor: string | null }>(controlBase, `/v1/runs?${params}`);
+  return { items: response.runs, nextCursor: response.nextCursor };
 }
 
 async function rawRuns(): Promise<RawRun[]> {
-  return (await apiJson<{ runs: RawRun[] }>(controlBase, "/v1/runs")).runs;
+  return (await rawRunsPage()).items;
 }
 
 async function gatewayStatusRaw() {
@@ -382,8 +402,14 @@ function eventSummary(event: RawEvent): string {
 }
 
 export async function listHarnessSummaries(filters?: { query?: string; domain?: string; modelTier?: string }): Promise<HarnessSummary[]> {
-  const [records, runs] = await Promise.all([planRecords(), rawRuns()]);
-  return records.flatMap(({ plan }) => {
+  return (await listHarnessSummariesPage(filters)).items;
+}
+
+export async function listHarnessSummariesPage(filters?: {
+  query?: string; domain?: string; modelTier?: string; cursor?: string; limit?: number;
+}): Promise<CursorPage<HarnessSummary>> {
+  const [recordPage, runs] = await Promise.all([planRecordsPage(filters?.cursor, filters?.limit), rawRuns()]);
+  const items = recordPage.items.flatMap(({ plan }) => {
     const matches = runs.filter((run) => run.planDigest === plan.planDigest);
     const completed = matches.filter((run) => run.status === "completed").length;
     const durations = matches.map(duration).toSorted((left, right) => left - right);
@@ -419,6 +445,7 @@ export async function listHarnessSummaries(filters?: { query?: string; domain?: 
     if (filters?.modelTier && filters.modelTier !== "all" && !summary.modelTiers.includes(filters.modelTier)) return [];
     return [summary];
   });
+  return { items, nextCursor: recordPage.nextCursor };
 }
 
 export async function getHarnessDetail(planDigest: string): Promise<HarnessDetail | null> {
@@ -462,9 +489,20 @@ export async function admitCompiledPlan(rawText: string): Promise<{
 export async function listRuns(filters?: {
   query?: string; status?: string; planDigest?: string; domain?: string; modelTier?: string; onlyNeedsAttention?: boolean;
 }): Promise<RunSummary[]> {
-  const [runs, records, gateway] = await Promise.all([rawRuns(), planRecords(), gatewayStatusRaw()]);
+  return (await listRunsPage(filters)).items;
+}
+
+export async function listRunsPage(filters?: {
+  query?: string; status?: string; planDigest?: string; domain?: string; modelTier?: string;
+  onlyNeedsAttention?: boolean; cursor?: string; limit?: number;
+}): Promise<CursorPage<RunSummary>> {
+  const [runPage, records, gateway] = await Promise.all([
+    rawRunsPage(filters?.cursor, filters?.limit, filters?.planDigest && filters.planDigest !== "all" ? decodeURIComponent(filters.planDigest) : undefined),
+    planRecords(),
+    gatewayStatusRaw(),
+  ]);
   const plans = new Map(records.map(({ plan }) => [plan.planDigest, plan]));
-  return runs.flatMap((run) => {
+  const items = runPage.items.flatMap((run) => {
     const plan = plans.get(run.planDigest);
     if (!plan) return [];
     const summary = summarizeRun(run, plan, gateway.runtimeMode);
@@ -477,6 +515,7 @@ export async function listRuns(filters?: {
     if (filters?.onlyNeedsAttention && !summary.needsAttention) return [];
     return [summary];
   });
+  return { items, nextCursor: runPage.nextCursor };
 }
 
 function mapReceipt(receipt: RawReceipt): GatewayDecisionView {
@@ -685,9 +724,19 @@ export async function listToolCapabilities(): Promise<ToolCapabilityView[]> {
 }
 
 export async function listGatewayDecisions(decisionFilter?: string): Promise<GatewayDecisionView[]> {
-  const query = decisionFilter && decisionFilter !== "all" ? `?decision=${encodeURIComponent(decisionFilter)}` : "";
-  const response = await apiJson<{ receipts: RawReceipt[] }>(controlBase, `/v1/gateway/receipts${query}`);
-  return response.receipts.map(mapReceipt);
+  return (await listGatewayDecisionsPage({ decision: decisionFilter })).items;
+}
+
+export async function listGatewayDecisionsPage(options: {
+  decision?: string; cursor?: string; limit?: number;
+} = {}): Promise<CursorPage<GatewayDecisionView>> {
+  const params = new URLSearchParams({ limit: String(options.limit ?? 100) });
+  if (options.decision && options.decision !== "all") params.set("decision", options.decision);
+  if (options.cursor) params.set("cursor", options.cursor);
+  const response = await apiJson<{ receipts: RawReceipt[]; nextCursor: string | null }>(
+    controlBase, `/v1/gateway/receipts?${params}`,
+  );
+  return { items: response.receipts.map(mapReceipt), nextCursor: response.nextCursor };
 }
 
 export async function getGatewayStatus(): Promise<GatewayStatusView> {
@@ -928,17 +977,24 @@ function mapCaseSummary(item: RawCaseSummary): CaseSummaryView {
 }
 
 export async function listCaseSummaries(filters?: { status?: string; query?: string }): Promise<CaseSummaryView[]> {
-  const query = filters?.status && filters.status !== "all"
-    ? `?status=${encodeURIComponent(filters.status)}`
-    : "";
-  const response = await apiJson<{ cases: RawCaseSummary[] }>(caseBase, `/v1/cases${query}`);
+  return (await listCaseSummariesPage(filters)).items;
+}
+
+export async function listCaseSummariesPage(filters?: {
+  status?: string; query?: string; cursor?: string; limit?: number;
+}): Promise<CursorPage<CaseSummaryView>> {
+  const params = new URLSearchParams({ limit: String(filters?.limit ?? 100) });
+  if (filters?.status && filters.status !== "all") params.set("status", filters.status);
+  if (filters?.cursor) params.set("cursor", filters.cursor);
+  const response = await apiJson<{ cases: RawCaseSummary[]; nextCursor: string | null }>(caseBase, `/v1/cases?${params}`);
   const needle = filters?.query?.trim().toLowerCase();
-  return response.cases.map(mapCaseSummary).filter((item) => !needle || [
+  const items = response.cases.map(mapCaseSummary).filter((item) => !needle || [
     item.caseId,
     item.externalRef,
     item.caseType,
     item.status,
   ].some((value) => value.toLowerCase().includes(needle)));
+  return { items, nextCursor: response.nextCursor };
 }
 
 export async function createDemoKycCase(input: {

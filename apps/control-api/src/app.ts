@@ -16,11 +16,10 @@ import {
   admitPlan, createAuthoringDraft, createDatabase, createRun, getAuthoringDraft, getPlan, getRun,
   requestRunCancellation, SeparationOfDutiesError,
   getAuthoringAgent, listAuthoringAgents, listAuthoringSkills, registerAuthoringAgent, registerAuthoringSkill,
-  listAuthoringDrafts, listAuthoringEvents, listEvents, listGatewayReceipts, listNodeAttempts, listPlanRecords,
-  listPlans, listRegisteredCapabilities, listRuns, setAuthoringLifecycle, updateAuthoringSources, type Database,
+  listAuthoringDrafts, listAuthoringEvents, listEventsPage, listGatewayReceiptsPage, listNodeAttempts, listPlanRecordsPage,
+  listRegisteredCapabilities, listRunsPage, setAuthoringLifecycle, updateAuthoringSources, type Database,
 } from "@ehf/persistence";
 import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import {
   analyzeAuthoringSources,
@@ -79,6 +78,9 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     if (error instanceof SeparationOfDutiesError) {
       return reply.code(403).send({ error: error.message, actor: error.actor });
     }
+    if (error instanceof Error && error.message.startsWith("pagination.")) {
+      return reply.code(400).send({ error: error.message });
+    }
     app.log.error(error);
     return reply.code(500).send({ error: "control.internal_error" });
   });
@@ -105,14 +107,22 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     if (!value) throw new EnvelopeBrokerError("broker.grant_secret_missing", 503);
     return value;
   };
-  const domainsPath = fileURLToPath(new URL("../../../domains/", import.meta.url));
-  app.get("/v1/plans", async (request) => {
+  const domainsPath = env.DOMAINS_PATH ?? resolve(process.cwd(), "domains");
+  app.get<{ Querystring: { cursor?: string; limit?: string } }>("/v1/plans", async (request) => {
     const principal = await requirePrincipal(request, "plan.read", { kind: "plan" });
-    return { plans: await listPlans(db, principal.tenantId) };
+    const page = await listPlanRecordsPage(db, principal.tenantId, {
+      ...(request.query.cursor ? { cursor: request.query.cursor } : {}),
+      ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
+    });
+    return { plans: page.items.map((record) => record.plan), nextCursor: page.nextCursor };
   });
-  app.get("/v1/plan-records", async (request) => {
+  app.get<{ Querystring: { cursor?: string; limit?: string } }>("/v1/plan-records", async (request) => {
     const principal = await requirePrincipal(request, "plan.read", { kind: "plan" });
-    return { records: await listPlanRecords(db, principal.tenantId) };
+    const page = await listPlanRecordsPage(db, principal.tenantId, {
+      ...(request.query.cursor ? { cursor: request.query.cursor } : {}),
+      ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
+    });
+    return { records: page.items, nextCursor: page.nextCursor };
   });
   app.get<{ Params: { digest: string } }>("/v1/plans/:digest", async (request, reply) => {
     const principal = await requirePrincipal(request, "plan.read", { kind: "plan", id: request.params.digest });
@@ -389,9 +399,14 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     }
   });
 
-  app.get("/v1/runs", async (request) => {
+  app.get<{ Querystring: { cursor?: string; limit?: string; planDigest?: string } }>("/v1/runs", async (request) => {
     const principal = await requirePrincipal(request, "run.read", { kind: "run" });
-    return { runs: await listRuns(db, principal.tenantId) };
+    const page = await listRunsPage(db, principal.tenantId, {
+      ...(request.query.cursor ? { cursor: request.query.cursor } : {}),
+      ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
+      ...(request.query.planDigest ? { planDigest: request.query.planDigest } : {}),
+    });
+    return { runs: page.items, nextCursor: page.nextCursor };
   });
   app.post("/v1/runs", async (request, reply) => {
     const principal = await requirePrincipal(request, "run.start", { kind: "run" });
@@ -410,6 +425,10 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     } catch (error) {
       if (error instanceof Error && error.message === "run.idempotency_conflict") {
         return reply.code(409).send({ error: error.message });
+      }
+      if (error instanceof Error && error.message === "run.queue_saturated") {
+        reply.header("retry-after", "5");
+        return reply.code(429).send({ error: error.message });
       }
       throw error;
     }
@@ -448,30 +467,34 @@ export function buildControlApi(options: ControlApiOptions = {}) {
       viewerUrl: base ? `${base}/trace/${run.traceId}` : null,
     };
   });
-  app.get<{ Params: { runId: string }; Querystring: { after?: string } }>("/v1/runs/:runId/events", async (request, reply) => {
+  app.get<{ Params: { runId: string }; Querystring: { after?: string; limit?: string } }>("/v1/runs/:runId/events", async (request, reply) => {
     const principal = await requirePrincipal(request, "event.read", { kind: "run", id: request.params.runId });
     if (!await getRun(db, request.params.runId, principal.tenantId)) return reply.code(404).send({ error: "run.not_found" });
-    return { events: await listEvents(db, request.params.runId, principal.tenantId, Number(request.query.after ?? 0)) };
+    const page = await listEventsPage(db, request.params.runId, principal.tenantId, {
+      afterSequence: Number(request.query.after ?? 0),
+      ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
+    });
+    return { events: page.items, nextCursor: page.nextCursor };
   });
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId/attempts", async (request, reply) => {
     const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
     if (!await getRun(db, request.params.runId, principal.tenantId)) return reply.code(404).send({ error: "run.not_found" });
     return { attempts: await listNodeAttempts(db, request.params.runId) };
   });
-  app.get<{ Querystring: { runId?: string; decision?: string; limit?: string } }>("/v1/gateway/receipts", async (request, reply) => {
+  app.get<{ Querystring: { runId?: string; decision?: string; limit?: string; cursor?: string } }>("/v1/gateway/receipts", async (request, reply) => {
     const principal = await requirePrincipal(request, "receipt.read", { kind: "receipt" });
     const decision = request.query.decision;
     if (decision && decision !== "allowed" && decision !== "denied") {
       return reply.code(400).send({ error: "gateway.decision_filter_invalid" });
     }
     const normalizedDecision = decision === "allowed" || decision === "denied" ? decision : undefined;
-    return {
-      receipts: await listGatewayReceipts(db, principal.tenantId, {
+    const page = await listGatewayReceiptsPage(db, principal.tenantId, {
         ...(request.query.runId ? { runId: request.query.runId } : {}),
         ...(normalizedDecision ? { decision: normalizedDecision } : {}),
         ...(request.query.limit ? { limit: Number(request.query.limit) } : {}),
-      }),
-    };
+        ...(request.query.cursor ? { cursor: request.query.cursor } : {}),
+    });
+    return { receipts: page.items, nextCursor: page.nextCursor };
   });
   app.addHook("onClose", async () => { if (!options.db) await db.end(); });
   return app;

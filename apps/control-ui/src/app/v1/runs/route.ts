@@ -1,26 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getGatewayStatus, listRuns, startNewRun } from "@/lib/runtime-service";
+import { getGatewayStatus, listRunsPage, startNewRun } from "@/lib/runtime-service";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   try {
     const sp = req.nextUrl.searchParams;
-    const [items, gateway] = await Promise.all([
-      listRuns({
+    const [page, gateway] = await Promise.all([
+      listRunsPage({
         query: sp.get("query") || undefined,
         status: sp.get("status") || undefined,
         planDigest: sp.get("planDigest") || undefined,
         domain: sp.get("domain") || undefined,
         modelTier: sp.get("modelTier") || undefined,
         onlyNeedsAttention: sp.get("onlyNeedsAttention") === "true",
+        cursor: sp.get("cursor") || undefined,
+        limit: sp.get("limit") ? Number(sp.get("limit")) : undefined,
       }),
       getGatewayStatus(),
     ]);
     const nowIso = new Date().toISOString();
     return NextResponse.json({
-      items,
-      nextCursor: null,
+      items: page.items,
+      nextCursor: page.nextCursor,
       generatedAt: nowIso,
       telemetryFreshThrough: nowIso,
       runtimeMode: gateway.runtimeMode,

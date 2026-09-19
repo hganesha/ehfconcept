@@ -14,6 +14,30 @@ import { caseStoreSchemas, qualify, type CaseStoreSchemas } from "./config.js";
 
 const { Pool } = pg;
 export type CaseStoreDatabase = InstanceType<typeof Pool>;
+export type Page<T> = { items: T[]; nextCursor: string | null };
+
+function encodeCursor(value: Record<string, string>): string {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function decodeCursor(cursor: string | undefined): { at: string; id: string } | null {
+  if (!cursor) return null;
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { at?: unknown; id?: unknown };
+    if (typeof value.at !== "string" || !Number.isFinite(Date.parse(value.at)) || typeof value.id !== "string" || !value.id) throw new Error();
+    return { at: value.at, id: value.id };
+  } catch {
+    throw new CaseStoreError("pagination.cursor_invalid", 400);
+  }
+}
+
+function pageLimit(value: number | undefined, maximum = 200): number {
+  const limit = value ?? 100;
+  if (!Number.isInteger(limit) || limit < 1 || limit > maximum) {
+    throw new CaseStoreError("pagination.limit_invalid", 400);
+  }
+  return limit;
+}
 
 export type CaseStore = {
   db: CaseStoreDatabase;
@@ -47,14 +71,22 @@ export function createCaseStore(options: {
   if (artifactBackend !== "postgres") throw new Error(`case_store.artifact_backend_unsupported:${artifactBackend}`);
   if (!options.db && !connectionString) throw new Error("case_store.database_url_missing");
   if (!Number.isInteger(evidenceMaxBytes) || evidenceMaxBytes < 1) throw new Error("case_store.evidence_max_bytes_invalid");
-  const poolMax = Number(process.env.DB_POOL_MAX ?? 12);
+  const poolMax = Number(process.env.DB_POOL_MAX ?? 5);
   if (!Number.isInteger(poolMax) || poolMax < 1 || poolMax > 100) throw new Error("database.pool_max_invalid");
+  const connectionTimeoutMillis = Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 5_000);
+  const idleTimeoutMillis = Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30_000);
+  if (!Number.isInteger(connectionTimeoutMillis) || connectionTimeoutMillis < 100 || connectionTimeoutMillis > 120_000) {
+    throw new Error("database.connect_timeout_invalid");
+  }
+  if (!Number.isInteger(idleTimeoutMillis) || idleTimeoutMillis < 1_000 || idleTimeoutMillis > 3_600_000) {
+    throw new Error("database.idle_timeout_invalid");
+  }
   return {
     db: options.db ?? new Pool({
       connectionString,
       max: poolMax,
-      connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 5_000),
-      idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30_000),
+      connectionTimeoutMillis,
+      idleTimeoutMillis,
       ...(isAzureMode() ? { password: createPostgresAccessTokenProvider() } : {}),
     }),
     schemas: options.schemas ?? caseStoreSchemas(),
@@ -1082,15 +1114,30 @@ export async function submitBusinessCommand(
 
 export async function listCases(
   store: CaseStore,
-  input: { tenantId: string; status?: KycCaseStatus; limit?: number },
+  input: { tenantId: string; status?: KycCaseStatus; limit?: number; cursor?: string },
 ) {
-  const limit = Math.max(1, Math.min(200, input.limit ?? 100));
+  return (await listCasesPage(store, input)).items;
+}
+
+export async function listCasesPage(
+  store: CaseStore,
+  input: { tenantId: string; status?: KycCaseStatus; limit?: number; cursor?: string },
+): Promise<Page<ReturnType<typeof mapCase>>> {
+  const limit = pageLimit(input.limit);
+  const cursor = decodeCursor(input.cursor);
   const result = await store.db.query<CaseRow>(`
     select * from ${qualify(store.schemas.core, "cases")}
     where tenant_id = $1 and ($2::text is null or status = $2)
-    order by updated_at desc, case_id limit $3
-  `, [input.tenantId, input.status ?? null, limit]);
-  return result.rows.map(mapCase);
+      and ($3::timestamptz is null or (updated_at, case_id) < ($3::timestamptz, $4))
+    order by updated_at desc, case_id desc limit $5
+  `, [input.tenantId, input.status ?? null, cursor?.at ?? null, cursor?.id ?? "", limit + 1]);
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  const last = rows.at(-1);
+  return {
+    items: rows.map(mapCase),
+    nextCursor: hasMore && last ? encodeCursor({ at: mapDate(last.updated_at)!, id: last.case_id }) : null,
+  };
 }
 
 async function selectRows(store: CaseStore, schema: string, table: string, tenantId: string, caseId: string) {
@@ -1145,6 +1192,23 @@ export async function getCaseView(store: CaseStore, tenantId: string, caseId: st
 }
 
 export async function listCaseEvents(store: CaseStore, tenantId: string, caseId: string, afterSequence = 0) {
+  return (await listCaseEventsPage(store, tenantId, caseId, { afterSequence })).items;
+}
+
+export async function listCaseEventsPage(
+  store: CaseStore,
+  tenantId: string,
+  caseId: string,
+  options: { afterSequence?: number; limit?: number } = {},
+): Promise<Page<{
+  tenantId: string; caseId: string; caseSequence: number; eventId: string; eventType: string;
+  eventSchema: string; occurredAt: string | null; recordedAt: string | null; actor: unknown;
+  commandRef: string; authority: unknown; payload: unknown; evidenceRefs: string[];
+  previousEventDigest: string | null; eventDigest: string;
+}>> {
+  const limit = pageLimit(options.limit, 1_000);
+  const afterSequence = options.afterSequence ?? 0;
+  if (!Number.isInteger(afterSequence) || afterSequence < 0) throw new CaseStoreError("pagination.cursor_invalid", 400);
   const result = await store.db.query<{
     tenant_id: string; case_id: string; case_sequence: string | number; event_id: string; event_type: string;
     event_schema: string; occurred_at: Date; recorded_at: Date; actor: unknown; command_id: string;
@@ -1152,9 +1216,11 @@ export async function listCaseEvents(store: CaseStore, tenantId: string, caseId:
   }>(`
     select * from ${qualify(store.schemas.ledger, "case_events")}
     where tenant_id = $1 and case_id = $2 and case_sequence > $3
-    order by case_sequence limit 1000
-  `, [tenantId, caseId, afterSequence]);
-  return result.rows.map((row) => ({
+    order by case_sequence limit $4
+  `, [tenantId, caseId, afterSequence, limit + 1]);
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  const items = rows.map((row) => ({
     tenantId: row.tenant_id,
     caseId: row.case_id,
     caseSequence: Number(row.case_sequence),
@@ -1171,6 +1237,7 @@ export async function listCaseEvents(store: CaseStore, tenantId: string, caseId:
     previousEventDigest: row.previous_event_digest,
     eventDigest: row.event_digest,
   }));
+  return { items, nextCursor: hasMore ? String(items.at(-1)?.caseSequence ?? afterSequence) : null };
 }
 
 export async function getEvidence(store: CaseStore, tenantId: string, evidenceId: string) {

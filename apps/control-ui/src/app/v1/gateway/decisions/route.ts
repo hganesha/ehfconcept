@@ -1,16 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { listGatewayDecisions } from "@/lib/runtime-service";
+import { listGatewayDecisionsPage } from "@/lib/runtime-service";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   try {
     const decision = req.nextUrl.searchParams.get("decision") || undefined;
-    const items = await listGatewayDecisions(decision);
+    const page = await listGatewayDecisionsPage({
+      decision,
+      cursor: req.nextUrl.searchParams.get("cursor") || undefined,
+      limit: req.nextUrl.searchParams.get("limit") ? Number(req.nextUrl.searchParams.get("limit")) : undefined,
+    });
     const nowIso = new Date().toISOString();
     return NextResponse.json({
-      items,
-      nextCursor: null,
+      items: page.items,
+      nextCursor: page.nextCursor,
       generatedAt: nowIso,
       telemetryFreshThrough: nowIso,
     });

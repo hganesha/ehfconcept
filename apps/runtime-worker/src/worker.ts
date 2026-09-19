@@ -1,4 +1,5 @@
 import { hostname } from "node:os";
+import { createServer } from "node:http";
 import { stableDigest, type RuntimeInvocation } from "@ehf/contracts";
 import {
   appendEvent,
@@ -8,9 +9,11 @@ import {
   completeCancelledRun,
   completeRun,
   createDatabase,
+  createRunQueueListener,
   failExhaustedRuns,
   finalizeAbandonedCancellations,
   getPlan,
+  getRunQueueStats,
   renewLease,
   scheduleRunRetry,
 } from "@ehf/persistence";
@@ -54,6 +57,10 @@ const leaseSeconds = Number(process.env.WORKER_LEASE_SECONDS ?? 60);
 const pollMs = Number(process.env.WORKER_POLL_MS ?? 750);
 const retryBaseMs = Number(process.env.WORKER_RETRY_BASE_MS ?? 2_000);
 const retryMaxMs = Number(process.env.WORKER_RETRY_MAX_MS ?? 60_000);
+const metricsPort = Number(process.env.WORKER_METRICS_PORT ?? 9090);
+const inFlight = new Set<string>();
+let claimedTotal = 0;
+let failedIterationsTotal = 0;
 
 /**
  * A denial is a decision, not a fault.
@@ -76,6 +83,9 @@ function backoffMs(attempt: number): number {
 async function workOnce(slotWorkerId: string): Promise<boolean> {
   const run = await claimRun(db, slotWorkerId, leaseSeconds);
   if (!run) return false;
+  inFlight.add(run.runId);
+  claimedTotal += 1;
+  try {
   const claimedRun = run;
   const plan = await getPlan(db, run.planDigest);
   if (!plan) throw new Error("runtime.plan_missing");
@@ -298,15 +308,70 @@ async function workOnce(slotWorkerId: string): Promise<boolean> {
       });
     }
   }, parent);
+  } finally {
+    inFlight.delete(run.runId);
+  }
 }
 
 if (!Number.isInteger(workerConcurrency) || workerConcurrency < 1 || workerConcurrency > 64) {
   throw new Error("runtime.worker_concurrency_invalid");
 }
+if (!Number.isInteger(metricsPort) || metricsPort < 1 || metricsPort > 65_535) {
+  throw new Error("runtime.worker_metrics_port_invalid");
+}
+if (!Number.isFinite(pollMs) || pollMs < 25 || pollMs > 60_000) {
+  throw new Error("runtime.worker_poll_interval_invalid");
+}
 
 let stopping = false;
 process.on("SIGTERM", () => { stopping = true; });
 process.on("SIGINT", () => { stopping = true; });
+
+const queueListener = await createRunQueueListener(db).catch((error: unknown) => {
+  process.stderr.write(`dispatcher.listen_unavailable ${error instanceof Error ? error.message : "unknown"}\n`);
+  return null;
+});
+
+const metricsServer = createServer(async (request, response) => {
+  if (request.url === "/health/live") {
+    response.writeHead(200, { "content-type": "application/json" }).end('{"status":"ok"}');
+    return;
+  }
+  if (request.url !== "/health/ready" && request.url !== "/metrics") {
+    response.writeHead(404).end();
+    return;
+  }
+  try {
+    const queue = await getRunQueueStats(db);
+    if (request.url === "/health/ready") {
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+        status: "ready", concurrency: workerConcurrency, inFlight: inFlight.size, queue,
+      }));
+      return;
+    }
+    const lines = [
+      "# TYPE ehf_runtime_worker_concurrency gauge",
+      `ehf_runtime_worker_concurrency ${workerConcurrency}`,
+      "# TYPE ehf_runtime_worker_in_flight gauge",
+      `ehf_runtime_worker_in_flight ${inFlight.size}`,
+      "# TYPE ehf_runtime_queue_ready gauge",
+      `ehf_runtime_queue_ready ${queue.ready}`,
+      "# TYPE ehf_runtime_queue_delayed gauge",
+      `ehf_runtime_queue_delayed ${queue.delayed}`,
+      "# TYPE ehf_runtime_queue_oldest_ready_seconds gauge",
+      `ehf_runtime_queue_oldest_ready_seconds ${queue.oldestReadySeconds}`,
+      "# TYPE ehf_runtime_worker_claimed_total counter",
+      `ehf_runtime_worker_claimed_total ${claimedTotal}`,
+      "# TYPE ehf_runtime_worker_iteration_failures_total counter",
+      `ehf_runtime_worker_iteration_failures_total ${failedIterationsTotal}`,
+      "",
+    ];
+    response.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(lines.join("\n"));
+  } catch {
+    response.writeHead(503, { "content-type": "application/json" }).end('{"status":"unavailable"}');
+  }
+});
+metricsServer.listen(metricsPort, "0.0.0.0");
 
 // A throw here used to reject at the top level and take the process with it, so one
 // unadmitted plan or one transport error turned into a container restart loop. The loop
@@ -319,6 +384,7 @@ async function runSlot(slot: number): Promise<void> {
     try {
       worked = await workOnce(slotWorkerId);
     } catch (error) {
+      failedIterationsTotal += 1;
       process.stderr.write(`dispatcher.iteration_failed ${error instanceof Error ? error.message : "unknown"}\n`);
     }
     if (!worked) {
@@ -328,10 +394,13 @@ async function runSlot(slot: number): Promise<void> {
           await finalizeAbandonedCancellations(db);
         } catch { /* the sweep retries on the next idle poll */ }
       }
-      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      if (queueListener) await queueListener.wait(pollMs);
+      else await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
   }
 }
 await Promise.all(Array.from({ length: workerConcurrency }, (_, slot) => runSlot(slot)));
+await queueListener?.close();
+await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 await db.end();
 await telemetry.shutdown();

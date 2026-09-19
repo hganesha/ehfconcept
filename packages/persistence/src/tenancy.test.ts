@@ -13,23 +13,52 @@ const runRow = {
 describe("control-plane tenant integrity", () => {
   it("scopes run idempotency to tenant and binds it to the request digest", async () => {
     const calls: Array<{ text: string; values: unknown[] }> = [];
-    const db = { query: async (text: string, values: unknown[]) => {
+    const client = { query: async (text: string, values: unknown[] = []) => {
       calls.push({ text, values });
-      return { rowCount: 1, rows: [runRow] };
-    } } as unknown as Database;
+      if (text.includes("where tenant_id = $1 and idempotency_key = $2")) return { rows: [] };
+      if (text.includes("count(*)::text")) return { rows: [{ count: "0" }] };
+      if (text.includes("insert into harness_runtime.runs")) return { rowCount: 1, rows: [runRow] };
+      return { rows: [] };
+    }, release: () => {} };
+    const db = { connect: async () => client } as unknown as Database;
 
     await createRun(db, { tenantId: "tenant-a", idempotencyKey: "idem-1", planDigest: "a".repeat(64), runInput: { value: 1 } });
-    expect(calls[0]?.text).toContain("on conflict (tenant_id, idempotency_key)");
-    expect(calls[0]?.text).toContain("request_digest = excluded.request_digest");
-    expect(calls[0]?.values[4]).toBe("tenant-a");
-    expect(calls[0]?.values[5]).toMatch(/^[a-f0-9]{64}$/);
+    const insert = calls.find((call) => call.text.includes("insert into harness_runtime.runs"));
+    expect(insert?.values[4]).toBe("tenant-a");
+    expect(insert?.values[5]).toMatch(/^[a-f0-9]{64}$/);
+    expect(calls.some((call) => call.text.includes("pg_advisory_xact_lock"))).toBe(true);
+    expect(calls.some((call) => call.text.includes("pg_notify('harness_run_queue'"))).toBe(true);
   });
 
   it("fails closed when an idempotency key is reused for different content", async () => {
-    const db = { query: async () => ({ rowCount: 0, rows: [] }) } as unknown as Database;
+    const client = { query: async (text: string) => {
+      if (text.includes("select request_digest")) return { rows: [{ request_digest: "different" }] };
+      if (text.includes("select run_id")) return { rows: [runRow] };
+      return { rows: [] };
+    }, release: () => {} };
+    const db = { connect: async () => client } as unknown as Database;
     await expect(createRun(db, {
       tenantId: "tenant-a", idempotencyKey: "idem-1", planDigest: "a".repeat(64), runInput: { value: 2 },
     })).rejects.toThrow("run.idempotency_conflict");
+  });
+
+  it("applies queue backpressure after checking for an idempotent replay", async () => {
+    const previous = process.env.RUN_QUEUE_MAX_PENDING;
+    process.env.RUN_QUEUE_MAX_PENDING = "1";
+    const client = { query: async (text: string) => {
+      if (text.includes("where tenant_id = $1 and idempotency_key = $2")) return { rows: [] };
+      if (text.includes("count(*)::text")) return { rows: [{ count: "1" }] };
+      return { rows: [] };
+    }, release: () => {} };
+    const db = { connect: async () => client } as unknown as Database;
+    try {
+      await expect(createRun(db, {
+        tenantId: "tenant-a", idempotencyKey: "idem-new", planDigest: "a".repeat(64), runInput: {},
+      })).rejects.toThrow("run.queue_saturated");
+    } finally {
+      if (previous === undefined) delete process.env.RUN_QUEUE_MAX_PENDING;
+      else process.env.RUN_QUEUE_MAX_PENDING = previous;
+    }
   });
 
   it("joins events to their tenant-owned run", async () => {
@@ -41,7 +70,7 @@ describe("control-plane tenant integrity", () => {
     await listEvents(db, "RUN-1", "tenant-a", 7);
     expect(calls[0]?.text).toContain("run.tenant_id = $2");
     expect(calls[0]?.text).toContain("event.status");
-    expect(calls[0]?.values).toEqual(["RUN-1", "tenant-a", 7]);
+    expect(calls[0]?.values).toEqual(["RUN-1", "tenant-a", 7, 101]);
   });
 
   it("requires a tenant for receipt listings", async () => {

@@ -1,19 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { listRuns } from "@/lib/runtime-service";
+import { listRunsPage } from "@/lib/runtime-service";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   context: { params: Promise<{ planDigest: string }> }
 ) {
   try {
     const { planDigest } = await context.params;
-    const items = await listRuns({ planDigest });
+    const page = await listRunsPage({
+      planDigest,
+      cursor: req.nextUrl.searchParams.get("cursor") || undefined,
+      limit: req.nextUrl.searchParams.get("limit") ? Number(req.nextUrl.searchParams.get("limit")) : undefined,
+    });
     const nowIso = new Date().toISOString();
     return NextResponse.json({
-      items,
-      nextCursor: null,
+      items: page.items,
+      nextCursor: page.nextCursor,
       generatedAt: nowIso,
       telemetryFreshThrough: nowIso,
     });

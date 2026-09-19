@@ -23,16 +23,51 @@ import {
 const { Pool } = pg;
 export type Database = InstanceType<typeof Pool>;
 
+export type Page<T> = { items: T[]; nextCursor: string | null };
+
+function encodeCursor(value: Record<string, string | number>): string {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function decodeCursor<T extends Record<string, string | number>>(cursor: string | undefined, fields: (keyof T)[]): T | null {
+  if (!cursor) return null;
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as T;
+    if (!value || fields.some((field) => typeof value[field] !== "string" && typeof value[field] !== "number")) {
+      throw new Error("pagination.cursor_invalid");
+    }
+    return value;
+  } catch {
+    throw new Error("pagination.cursor_invalid");
+  }
+}
+
+function pageLimit(value: number | undefined, maximum = 200): number {
+  const limit = value ?? 100;
+  if (!Number.isInteger(limit) || limit < 1 || limit > maximum) throw new Error("pagination.limit_invalid");
+  return limit;
+}
+
 export function createDatabase(connectionString = process.env.DATABASE_URL): Database {
   if (!connectionString) throw new Error("database.url_missing");
-  const max = Number(process.env.DB_POOL_MAX ?? 12);
+  // Five is deliberately conservative. Production replica counts and this value must
+  // fit inside the PgBouncer/PostgreSQL connection budget; see deploy/performance.md.
+  const max = Number(process.env.DB_POOL_MAX ?? 5);
   if (!Number.isInteger(max) || max < 1 || max > 100) throw new Error("database.pool_max_invalid");
+  const connectionTimeoutMillis = Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 5_000);
+  const idleTimeoutMillis = Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30_000);
+  if (!Number.isInteger(connectionTimeoutMillis) || connectionTimeoutMillis < 100 || connectionTimeoutMillis > 120_000) {
+    throw new Error("database.connect_timeout_invalid");
+  }
+  if (!Number.isInteger(idleTimeoutMillis) || idleTimeoutMillis < 1_000 || idleTimeoutMillis > 3_600_000) {
+    throw new Error("database.idle_timeout_invalid");
+  }
   return new Pool({
     connectionString,
     ...(isAzureMode() ? { password: createPostgresAccessTokenProvider() } : {}),
     max,
-    connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 5_000),
-    idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30_000),
+    connectionTimeoutMillis,
+    idleTimeoutMillis,
   });
 }
 
@@ -128,24 +163,42 @@ export async function getPlan(db: Database, digest: string, tenantId?: string): 
 }
 
 export async function listPlans(db: Database, tenantId: string): Promise<HarnessPlan[]> {
-  const result = await db.query<{ plan: unknown }>(
-    "select plan from harness_control.plans where tenant_id = $1 order by admitted_at desc limit 100",
-    [tenantId],
-  );
-  return result.rows.map((row) => harnessPlanSchema.parse(row.plan));
+  return (await listPlanRecordsPage(db, tenantId)).items.map((record) => record.plan);
 }
 
 export type PlanRecord = { plan: HarnessPlan; admittedAt: string };
 
 export async function listPlanRecords(db: Database, tenantId: string): Promise<PlanRecord[]> {
-  const result = await db.query<{ plan: unknown; admitted_at: Date }>(
-    "select plan, admitted_at from harness_control.plans where tenant_id = $1 order by admitted_at desc limit 100",
-    [tenantId],
-  );
-  return result.rows.map((row) => ({
+  return (await listPlanRecordsPage(db, tenantId)).items;
+}
+
+export async function listPlanRecordsPage(
+  db: Database,
+  tenantId: string,
+  options: { cursor?: string; limit?: number } = {},
+): Promise<Page<PlanRecord>> {
+  const limit = pageLimit(options.limit);
+  const cursor = decodeCursor<{ at: string; id: string }>(options.cursor, ["at", "id"]);
+  if (cursor && (!Number.isFinite(Date.parse(cursor.at)) || !cursor.id)) throw new Error("pagination.cursor_invalid");
+  const result = await db.query<{ plan: unknown; admitted_at: Date; plan_digest: string }>(`
+    select plan, admitted_at, plan_digest
+    from harness_control.plans
+    where tenant_id = $1
+      and ($2::timestamptz is null or (admitted_at, plan_digest) < ($2::timestamptz, $3))
+    order by admitted_at desc, plan_digest desc
+    limit $4
+  `, [tenantId, cursor?.at ?? null, cursor?.id ?? "", limit + 1]);
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  const items = rows.map((row) => ({
     plan: harnessPlanSchema.parse(row.plan),
     admittedAt: row.admitted_at.toISOString(),
   }));
+  const last = rows.at(-1);
+  return {
+    items,
+    nextCursor: hasMore && last ? encodeCursor({ at: last.admitted_at.toISOString(), id: last.plan_digest }) : null,
+  };
 }
 
 export async function createRun(
@@ -154,17 +207,45 @@ export async function createRun(
 ): Promise<{ created: boolean; run: RunRecord }> {
   const runId = `RUN-${randomUUID()}`;
   const requestDigest = stableDigest({ planDigest: input.planDigest, input: input.runInput });
-  const result = await db.query<RunRow>(`
-    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input, tenant_id, request_digest)
-    values ($1, $2, $3, 'queued', $4::jsonb, $5, $6)
-    on conflict (tenant_id, idempotency_key) do update
-      set updated_at = harness_runtime.runs.updated_at
-      where harness_runtime.runs.request_digest = excluded.request_digest
-    returning ${runColumns}
-  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput), input.tenantId, requestDigest]);
-  const row = result.rows[0];
-  if (!row) throw new Error("run.idempotency_conflict");
-  return { created: row.run_id === runId, run: mapRun(row) };
+  const maxPending = Number(process.env.RUN_QUEUE_MAX_PENDING ?? 10_000);
+  if (!Number.isInteger(maxPending) || maxPending < 1) throw new Error("run.queue_limit_invalid");
+  const client = await db.connect();
+  try {
+    await client.query("begin");
+    // Serialize admission per tenant so concurrent requests cannot all observe the same
+    // remaining queue capacity. Idempotent replays are checked before backpressure.
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [input.tenantId]);
+    const existing = await client.query<RunRow>(`
+      select ${runColumns} from harness_runtime.runs
+      where tenant_id = $1 and idempotency_key = $2
+    `, [input.tenantId, input.idempotencyKey]);
+    if (existing.rows[0]) {
+      const digest = await client.query<{ request_digest: string }>(`
+        select request_digest from harness_runtime.runs where tenant_id = $1 and idempotency_key = $2
+      `, [input.tenantId, input.idempotencyKey]);
+      if (digest.rows[0]?.request_digest !== requestDigest) throw new Error("run.idempotency_conflict");
+      await client.query("commit");
+      return { created: false, run: mapRun(existing.rows[0]) };
+    }
+    const depth = await client.query<{ count: string }>(`
+      select count(*)::text as count from harness_runtime.runs
+      where tenant_id = $1 and status in ('queued', 'retrying', 'running')
+    `, [input.tenantId]);
+    if (Number(depth.rows[0]?.count ?? 0) >= maxPending) throw new Error("run.queue_saturated");
+    const result = await client.query<RunRow>(`
+      insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input, tenant_id, request_digest)
+      values ($1, $2, $3, 'queued', $4::jsonb, $5, $6)
+      returning ${runColumns}
+    `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput), input.tenantId, requestDigest]);
+    await client.query("select pg_notify('harness_run_queue', $1)", [runId]);
+    await client.query("commit");
+    return { created: true, run: mapRun(result.rows[0]!) };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getRun(db: Database, runId: string, tenantId?: string): Promise<RunRecord | null> {
@@ -177,11 +258,104 @@ export async function getRun(db: Database, runId: string, tenantId?: string): Pr
 }
 
 export async function listRuns(db: Database, tenantId: string, limit = 100): Promise<RunRecord[]> {
-  const result = await db.query<RunRow>(
-    `select ${runColumns} from harness_runtime.runs where tenant_id = $1 order by updated_at desc limit $2`,
-    [tenantId, Math.max(1, Math.min(100, limit))],
-  );
-  return result.rows.map(mapRun);
+  return (await listRunsPage(db, tenantId, { limit })).items;
+}
+
+export async function listRunsPage(
+  db: Database,
+  tenantId: string,
+  options: { cursor?: string; limit?: number; planDigest?: string; status?: RunRecord["status"] } = {},
+): Promise<Page<RunRecord>> {
+  const limit = pageLimit(options.limit);
+  const cursor = decodeCursor<{ at: string; id: string }>(options.cursor, ["at", "id"]);
+  if (cursor && (!Number.isFinite(Date.parse(cursor.at)) || !cursor.id)) throw new Error("pagination.cursor_invalid");
+  const result = await db.query<RunRow>(`
+    select ${runColumns} from harness_runtime.runs
+    where tenant_id = $1
+      and ($2::text is null or plan_digest = $2)
+      and ($3::text is null or status = $3)
+      and ($4::timestamptz is null or (updated_at, run_id) < ($4::timestamptz, $5))
+    order by updated_at desc, run_id desc
+    limit $6
+  `, [tenantId, options.planDigest ?? null, options.status ?? null, cursor?.at ?? null, cursor?.id ?? "", limit + 1]);
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  const last = rows.at(-1);
+  return {
+    items: rows.map(mapRun),
+    nextCursor: hasMore && last ? encodeCursor({ at: last.updated_at.toISOString(), id: last.run_id }) : null,
+  };
+}
+
+export type RunQueueStats = {
+  ready: number;
+  delayed: number;
+  running: number;
+  oldestReadySeconds: number;
+};
+
+export async function getRunQueueStats(db: Database): Promise<RunQueueStats> {
+  const result = await db.query<{
+    ready: string; delayed: string; running: string; oldest_ready_seconds: string;
+  }>(`
+    select
+      count(*) filter (where status in ('queued','retrying') and (available_at is null or available_at <= now()))::text as ready,
+      count(*) filter (where status = 'retrying' and available_at > now())::text as delayed,
+      count(*) filter (where status = 'running')::text as running,
+      coalesce(extract(epoch from now() - min(created_at) filter (
+        where status in ('queued','retrying') and (available_at is null or available_at <= now())
+      )), 0)::text as oldest_ready_seconds
+    from harness_runtime.runs
+  `);
+  const row = result.rows[0]!;
+  return {
+    ready: Number(row.ready),
+    delayed: Number(row.delayed),
+    running: Number(row.running),
+    oldestReadySeconds: Math.max(0, Number(row.oldest_ready_seconds)),
+  };
+}
+
+export type RunQueueListener = {
+  wait(timeoutMs: number): Promise<"notified" | "timeout">;
+  close(): Promise<void>;
+};
+
+/**
+ * LISTEN is only a latency optimization: the dispatcher's bounded poll remains the
+ * recovery path for lost connections, delayed retries and PostgreSQL failover.
+ */
+export async function createRunQueueListener(db: Database): Promise<RunQueueListener> {
+  const client = await db.connect();
+  await client.query("listen harness_run_queue");
+  let generation = 0;
+  const waiters = new Set<() => void>();
+  const wake = () => {
+    generation += 1;
+    for (const waiter of waiters) waiter();
+    waiters.clear();
+  };
+  client.on("notification", wake);
+  client.on("error", wake);
+  return {
+    async wait(timeoutMs) {
+      const observed = generation;
+      return new Promise((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          waiters.delete(done);
+          resolve(generation === observed ? "timeout" : "notified");
+        };
+        const timer = setTimeout(done, Math.max(25, timeoutMs));
+        waiters.add(done);
+      });
+    },
+    async close() {
+      wake();
+      await client.query("unlisten harness_run_queue").catch(() => undefined);
+      client.release();
+    },
+  };
 }
 
 export type ClaimedRun = RunRecord & { workerId: string };
@@ -545,6 +719,18 @@ export async function appendEvent(
 }
 
 export async function listEvents(db: Database, runId: string, tenantId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
+  return (await listEventsPage(db, runId, tenantId, { afterSequence })).items;
+}
+
+export async function listEventsPage(
+  db: Database,
+  runId: string,
+  tenantId: string,
+  options: { afterSequence?: number; limit?: number } = {},
+): Promise<Page<RuntimeEvent>> {
+  const limit = pageLimit(options.limit, 1_000);
+  const afterSequence = options.afterSequence ?? 0;
+  if (!Number.isInteger(afterSequence) || afterSequence < 0) throw new Error("pagination.cursor_invalid");
   const result = await db.query<{
     sequence: string | number;
     code: string;
@@ -558,9 +744,11 @@ export async function listEvents(db: Database, runId: string, tenantId: string, 
     inner join harness_runtime.runs run on run.run_id = event.run_id
     where event.run_id = $1 and run.tenant_id = $2 and sequence > $3
     order by sequence
-    limit 1000
-  `, [runId, tenantId, afterSequence]);
-  return result.rows.map((row) => ({
+    limit $4
+  `, [runId, tenantId, afterSequence, limit + 1]);
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  const items = rows.map((row) => ({
     runId,
     sequence: Number(row.sequence),
     code: row.code,
@@ -569,6 +757,7 @@ export async function listEvents(db: Database, runId: string, tenantId: string, 
     values: row.values,
     occurredAt: row.occurred_at.toISOString(),
   }));
+  return { items, nextCursor: hasMore ? String(items.at(-1)?.sequence ?? afterSequence) : null };
 }
 
 export async function beginNodeAttempt(
@@ -762,7 +951,17 @@ export async function listGatewayReceipts(
   tenantId: string,
   options: { runId?: string; decision?: "allowed" | "denied"; limit?: number } = {},
 ): Promise<GatewayReceiptRecord[]> {
-  const limit = Math.max(1, Math.min(500, options.limit ?? 100));
+  return (await listGatewayReceiptsPage(db, tenantId, options)).items;
+}
+
+export async function listGatewayReceiptsPage(
+  db: Database,
+  tenantId: string,
+  options: { runId?: string; decision?: "allowed" | "denied"; limit?: number; cursor?: string } = {},
+): Promise<Page<GatewayReceiptRecord>> {
+  const limit = pageLimit(options.limit, 500);
+  const cursor = decodeCursor<{ at: string; id: string }>(options.cursor, ["at", "id"]);
+  if (cursor && (!Number.isFinite(Date.parse(cursor.at)) || !cursor.id)) throw new Error("pagination.cursor_invalid");
   const result = await db.query<{
     invocation_id: string; run_id: string; node_id: string; attempt: number; fencing_epoch: string | number;
     plan_digest: string; permission_digest: string; capability_id: string; effect: string;
@@ -777,10 +976,13 @@ export async function listGatewayReceipts(
     where tenant_id = $1
       and ($2::text is null or run_id = $2)
       and ($3::text is null or decision = $3)
-    order by case when decision = 'denied' then 0 else 1 end, created_at desc
-    limit $4
-  `, [tenantId, options.runId ?? null, options.decision ?? null, limit]);
-  return result.rows.map((row) => ({
+      and ($4::timestamptz is null or (created_at, invocation_id) < ($4::timestamptz, $5))
+    order by created_at desc, invocation_id desc
+    limit $6
+  `, [tenantId, options.runId ?? null, options.decision ?? null, cursor?.at ?? null, cursor?.id ?? "", limit + 1]);
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  const items = rows.map((row) => ({
     invocationId: row.invocation_id,
     runId: row.run_id,
     nodeId: row.node_id,
@@ -800,6 +1002,11 @@ export async function listGatewayReceipts(
     createdAt: row.created_at.toISOString(),
     completedAt: row.completed_at?.toISOString() ?? null,
   }));
+  const last = rows.at(-1);
+  return {
+    items,
+    nextCursor: hasMore && last ? encodeCursor({ at: last.created_at.toISOString(), id: last.invocation_id }) : null,
+  };
 }
 
 /**

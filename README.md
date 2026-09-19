@@ -74,6 +74,15 @@ The trace hierarchy follows the implementation standard: `harness.run` → `runt
 
 Verify an exported trace and its cross-service topology with `make trace RUN_ID=RUN-...`. The control API also exposes `GET /v1/runs/:runId/trace`, including a local Jaeger deep link.
 
+## Production performance
+
+The dispatcher supports bounded per-process concurrency, PostgreSQL queue notifications
+with polling recovery, queue backpressure, Prometheus metrics, and KEDA-compatible
+autoscaling. List APIs use stable keyset cursors, and service containers run compiled
+bundles as a non-root user without development dependencies. Connection budgeting,
+PgBouncer topology, load/soak gates, autoscaling, and digest/SBOM publishing are covered
+in [the production performance guide](deploy/performance.md).
+
 ## Platform mode
 
 The same images run locally and in Azure; the difference is configuration. `PLATFORM_MODE=azure`
@@ -95,7 +104,7 @@ Services fail to boot rather than serving traffic half-configured.
 
 ## Stable boundaries for the cloud phase
 
-The transferable seams are the `HarnessPlan` contract, compiler output, runtime adapter interface, execution envelope, capability request/result receipts, event vocabulary, and Postgres persistence model. A cloud phase can replace the local queue polling, secret signer, and deployment substrate without changing domain packages or bypassing the gateway.
+The transferable seams are the `HarnessPlan` contract, compiler output, runtime adapter interface, execution envelope, capability request/result receipts, event vocabulary, and Postgres persistence model. A cloud phase can replace PostgreSQL queue signaling, the secret signer, and the deployment substrate without changing domain packages or bypassing the gateway.
 
 The default local binding is `RUNTIME_PROVIDER=local_http`, with the dispatcher calling `runtime-host-local` over the internal Compose network. To select the Foundry adapter in Azure, set `RUNTIME_PROVIDER=azure_foundry`, `FOUNDRY_AGENT_INVOCATION_ENDPOINT`, `FOUNDRY_AGENT_NAME`, and immutable `FOUNDRY_AGENT_VERSION`; `DefaultAzureCredential` obtains the configured Foundry token. The runtime host accepts the Foundry message/result envelope, verifies inbound Entra credentials, and obtains fresh managed-identity tokens for calls back to the control plane, gateway, and case API. Deployment and promotion remain environment operations, not application fallbacks. The runtime journals through a private control-plane surface that re-checks the grant, lease, and fence before recording anything. Its only optional database handle is the LangGraph checkpoint store, selected by `RUNTIME_CHECKPOINT_BACKEND`; `memory` removes it entirely and makes the invocation non-resumable.
 

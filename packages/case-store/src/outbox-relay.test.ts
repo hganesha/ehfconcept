@@ -39,8 +39,11 @@ const row = (id: string) => ({
 describe("outbox relay", () => {
   it("claims, publishes, then marks delivered", async () => {
     const published: OutboxRecord[][] = [];
-    const sink: OutboxSink = { name: "test", publish: async (records) => { published.push(records); } };
     const { store: subject, statements } = store({ case: [row("ob_1")] });
+    const sink: OutboxSink = { name: "test", publish: async (records) => {
+      statements.push({ text: "sink.publish", values: [] });
+      published.push(records);
+    } };
     const result = await drainOutbox(subject, sink);
     expect(result.published).toBe(1);
     expect(published[0]?.[0]).toMatchObject({ outboxId: "ob_1", source: "case", eventType: "SubjectAdded" });
@@ -48,8 +51,12 @@ describe("outbox relay", () => {
     // event, and marked only after the sink accepted them.
     expect(statements.some((s) => s.text.includes("for update skip locked"))).toBe(true);
     const claimIndex = statements.findIndex((s) => s.text.includes("returning outbox.outbox_id"));
+    const commitIndex = statements.findIndex((s) => s.text === "commit");
+    const publishIndex = statements.findIndex((s) => s.text === "sink.publish");
     const markIndex = statements.findIndex((s) => s.text.includes("set published_at = now()"));
-    expect(markIndex).toBeGreaterThan(claimIndex);
+    expect(commitIndex).toBeGreaterThan(claimIndex);
+    expect(publishIndex).toBeGreaterThan(commitIndex);
+    expect(markIndex).toBeGreaterThan(publishIndex);
   });
 
   it("carries identifiers and classification, not case content", async () => {

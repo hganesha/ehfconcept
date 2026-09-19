@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS builder
+FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS builder
 WORKDIR /app
 RUN npm install --global pnpm@11.9.0
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
@@ -7,10 +7,10 @@ COPY packages ./packages
 COPY config ./config
 RUN --mount=type=cache,id=ehf-pnpm-store,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
-    pnpm install --frozen-lockfile --config.minimum-release-age=0 --network-concurrency=4 --fetch-retries=5 --fetch-timeout=120000
+    pnpm install --prefer-offline --frozen-lockfile --config.minimum-release-age=0 --network-concurrency=4 --fetch-retries=5 --fetch-timeout=120000
 RUN pnpm --filter @ehf/control-ui build
 
-FROM node:24-bookworm-slim AS runner
+FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS runner
 WORKDIR /app/apps/control-ui
 ENV NODE_ENV=production
 ENV PORT=4200
