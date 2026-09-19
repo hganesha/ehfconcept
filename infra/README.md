@@ -9,6 +9,43 @@ Backlog items `AZ-008` (core Bicep modules and parameters) and `AZ-009` (OIDC
 validation, build, and deploy workflows) in the
 [migration plan](../docs/plans/azure-poc-migration-plan.md).
 
+## Verified against
+
+`main` at `1418c25` ("Complete P0/P1 production hardening").
+
+The service contracts these templates configure — environment variables, startup
+commands, image layout — come from `compose.yaml` and the per-service startup
+invariants. They move with the code, so after merging a newer `main`, re-run the
+parity check before deploying:
+
+```bash
+# Every variable each compose service sets must appear in that service's
+# apps.bicep module, counting the shared telemetryEnv / caseStoreEnv /
+# platformEnv / workloadTokenEnv arrays it concatenates.
+python3 - <<'CHECK'
+import yaml, re, pathlib
+compose = yaml.safe_load(open("compose.yaml"))
+bicep = pathlib.Path("infra/apps.bicep").read_text()
+names = lambda b: set(re.findall(r"name: '([A-Z][A-Z0-9_]+)'", b))
+shared = {v: names(re.search(rf"var {v} = \[(.*?)\n\]", bicep, re.S).group(1))
+          for v in ("telemetryEnv", "caseStoreEnv", "platformEnv", "workloadTokenEnv")}
+blocks = dict(re.findall(r"module (\w+) 'modules/container-app\.bicep' = if \(!migrationOnly\) \{(.*?)\n\}", bicep, re.S))
+for c, b in {"control-api": "controlApi", "case-api": "caseApi", "capability-gateway": "gateway",
+             "runtime-host-local": "runtimeHost", "runtime-dispatcher": "dispatcher",
+             "control-ui": "controlUi"}.items():
+    have = names(blocks[b])
+    for var, vals in shared.items():
+        if re.search(rf"\b{var}\b", blocks[b]):
+            have |= vals
+    want = set(compose["services"][c].get("environment", {})) - {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"}
+    print(f"{c:20} missing={sorted(want - have) or '-'}")
+CHECK
+```
+
+Also re-check the image layout: `Dockerfile` prunes per service with
+`SERVICE_FILTER`, so a new service means a new image in `build-images.yml` and a
+new parameter in `apps.bicep`.
+
 ## Four stages
 
 Each stage exists because of a dependency the previous one creates. They are not
