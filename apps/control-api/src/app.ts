@@ -13,6 +13,7 @@ import {
 } from "@ehf/identity";
 import {
   admitPlan, createAuthoringDraft, createDatabase, createRun, getAuthoringDraft, getPlan, getRun,
+  SeparationOfDutiesError,
   getAuthoringAgent, listAuthoringAgents, listAuthoringSkills, registerAuthoringAgent, registerAuthoringSkill,
   listAuthoringDrafts, listAuthoringEvents, listEvents, listGatewayReceipts, listNodeAttempts, listPlanRecords,
   listPlans, listRegisteredCapabilities, listRuns, setAuthoringLifecycle, updateAuthoringSources, type Database,
@@ -74,6 +75,9 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     if (error instanceof AuthorizationError) {
       return reply.code(error.httpStatus).send({ error: error.decision.reasonCode });
     }
+    if (error instanceof SeparationOfDutiesError) {
+      return reply.code(403).send({ error: error.message, actor: error.actor });
+    }
     app.log.error(error);
     return reply.code(500).send({ error: "control.internal_error" });
   });
@@ -98,31 +102,31 @@ export function buildControlApi(options: ControlApiOptions = {}) {
   };
   const domainsPath = fileURLToPath(new URL("../../../domains/", import.meta.url));
   app.get("/v1/plans", async (request) => {
-    await requirePrincipal(request, "plan.read", { kind: "plan" });
-    return { plans: await listPlans(db) };
+    const principal = await requirePrincipal(request, "plan.read", { kind: "plan" });
+    return { plans: await listPlans(db, principal.tenantId) };
   });
   app.get("/v1/plan-records", async (request) => {
-    await requirePrincipal(request, "plan.read", { kind: "plan" });
-    return { records: await listPlanRecords(db) };
+    const principal = await requirePrincipal(request, "plan.read", { kind: "plan" });
+    return { records: await listPlanRecords(db, principal.tenantId) };
   });
   app.get<{ Params: { digest: string } }>("/v1/plans/:digest", async (request, reply) => {
-    await requirePrincipal(request, "plan.read", { kind: "plan", id: request.params.digest });
-    const plan = await getPlan(db, request.params.digest);
+    const principal = await requirePrincipal(request, "plan.read", { kind: "plan", id: request.params.digest });
+    const plan = await getPlan(db, request.params.digest, principal.tenantId);
     return plan ?? reply.code(404).send({ error: "plan.not_found" });
   });
   app.post("/v1/plans", async (request, reply) => {
-    await requirePrincipal(request, "plan.admit", { kind: "plan" });
+    const principal = await requirePrincipal(request, "plan.admit", { kind: "plan" });
     try {
       // admitPlan verifies the digest before it writes; do not re-order these.
-      const admitted = await admitPlan(db, request.body);
+      const admitted = await admitPlan(db, request.body, principal.tenantId);
       return reply.code(admitted.created ? 201 : 200).send(admitted);
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : "plan.invalid" });
     }
   });
   app.get("/v1/authoring/drafts", async (request) => {
-    await requirePrincipal(request, "draft.read", { kind: "draft" });
-    return { drafts: await listAuthoringDrafts(db) };
+    const principal = await requirePrincipal(request, "draft.read", { kind: "draft" });
+    return { drafts: await listAuthoringDrafts(db, principal.tenantId) };
   });
   app.get("/v1/authoring/agents", async (request) => {
     await requirePrincipal(request, "draft.read", { kind: "agent" });
@@ -164,6 +168,7 @@ export function buildControlApi(options: ControlApiOptions = {}) {
       const draft = await createAuthoringDraft(db, {
         packageSource, workflowSource, parsedPackage: analysis.parsedPackage, parsedWorkflow: analysis.parsedWorkflow,
         ...analysis.metadata, diagnostics: analysis.diagnostics, actor: principal.subjectId,
+        tenantId: principal.tenantId,
       });
       return reply.code(201).send(draft);
     } catch (error) {
@@ -181,8 +186,8 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     return { templates };
   });
   app.get<{ Params: { draftId: string } }>("/v1/authoring/drafts/:draftId", async (request, reply) => {
-    await requirePrincipal(request, "draft.read", { kind: "draft", id: request.params.draftId });
-    const draft = await getAuthoringDraft(db, request.params.draftId);
+    const principal = await requirePrincipal(request, "draft.read", { kind: "draft", id: request.params.draftId });
+    const draft = await getAuthoringDraft(db, request.params.draftId, principal.tenantId);
     if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
     return { ...draft, events: await listAuthoringEvents(db, draft.draftId) };
   });
@@ -212,7 +217,7 @@ export function buildControlApi(options: ControlApiOptions = {}) {
         return reply.code(400).send({ error: "authoring.agent_attachment_invalid" });
       }
       const [draft, registered, registeredSkills] = await Promise.all([
-        getAuthoringDraft(db, request.params.draftId),
+        getAuthoringDraft(db, request.params.draftId, principal.tenantId),
         getAuthoringAgent(db, request.params.agentId),
         listAuthoringSkills(db),
       ]);
@@ -242,7 +247,7 @@ export function buildControlApi(options: ControlApiOptions = {}) {
       if (typeof body.expectedRevision !== "number" || !Array.isArray(body.caseWrites)) {
         return reply.code(400).send({ error: "authoring.case_writes_update_invalid" });
       }
-      const draft = await getAuthoringDraft(db, request.params.draftId);
+      const draft = await getAuthoringDraft(db, request.params.draftId, principal.tenantId);
       if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
       const workflowSource = updateNodeCaseWrites(draft.workflowSource, request.params.nodeId, body.caseWrites);
       const analysis = analyzeAuthoringSources(draft.packageSource, workflowSource);
@@ -259,8 +264,8 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     }
   });
   app.post<{ Params: { draftId: string } }>("/v1/authoring/drafts/:draftId/validate", async (request, reply) => {
-    await requirePrincipal(request, "draft.read", { kind: "draft", id: request.params.draftId });
-    const draft = await getAuthoringDraft(db, request.params.draftId);
+    const principal = await requirePrincipal(request, "draft.read", { kind: "draft", id: request.params.draftId });
+    const draft = await getAuthoringDraft(db, request.params.draftId, principal.tenantId);
     if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
     const analysis = analyzeAuthoringSources(draft.packageSource, draft.workflowSource);
     return { valid: !analysis.diagnostics.some((item) => item.severity === "error"), diagnostics: analysis.diagnostics };
@@ -268,7 +273,7 @@ export function buildControlApi(options: ControlApiOptions = {}) {
   app.post<{ Params: { draftId: string } }>("/v1/authoring/drafts/:draftId/compile", async (request, reply) => {
     const principal = await requirePrincipal(request, "draft.compile", { kind: "draft", id: request.params.draftId });
     try {
-      let draft = await getAuthoringDraft(db, request.params.draftId);
+      let draft = await getAuthoringDraft(db, request.params.draftId, principal.tenantId);
       if (!draft) return reply.code(404).send({ error: "authoring.draft_not_found" });
       if (draft.status !== "DRAFT") return reply.code(409).send({ error: "authoring.compile_requires_draft" });
       const [registry, registeredAgents, registeredSkills] = await Promise.all([
@@ -305,7 +310,7 @@ export function buildControlApi(options: ControlApiOptions = {}) {
   app.post<{ Params: { draftId: string } }>("/v1/authoring/drafts/:draftId/evaluate", async (request, reply) => {
     const principal = await requirePrincipal(request, "draft.evaluate", { kind: "draft", id: request.params.draftId });
     try {
-      const draft = await getAuthoringDraft(db, request.params.draftId);
+      const draft = await getAuthoringDraft(db, request.params.draftId, principal.tenantId);
       if (!draft?.compiledPlan) return reply.code(409).send({ error: "authoring.evaluate_requires_compiled" });
       const report = evaluateCompiledPlan(draft.compiledPlan);
       if (!report.passed) return reply.code(422).send({ error: "authoring.evaluation_failed", report });
@@ -319,17 +324,19 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     try {
       return await setAuthoringLifecycle(db, request.params.draftId, { expectedStatus: "EVALUATED", status: "APPROVED", actor: principal.subjectId });
     } catch (error) {
+      if (error instanceof SeparationOfDutiesError) throw error;
       return reply.code(409).send({ error: error instanceof Error ? error.message : "authoring.approve_failed" });
     }
   });
   app.post<{ Params: { draftId: string } }>("/v1/authoring/drafts/:draftId/publish", async (request, reply) => {
     const principal = await requirePrincipal(request, "draft.publish", { kind: "draft", id: request.params.draftId });
     try {
-      const draft = await getAuthoringDraft(db, request.params.draftId);
+      const draft = await getAuthoringDraft(db, request.params.draftId, principal.tenantId);
       if (!draft?.compiledPlan || draft.status !== "APPROVED") return reply.code(409).send({ error: "authoring.publish_requires_approved" });
-      await admitPlan(db, draft.compiledPlan);
+      await admitPlan(db, draft.compiledPlan, principal.tenantId);
       return await setAuthoringLifecycle(db, draft.draftId, { expectedStatus: "APPROVED", status: "PUBLISHED", actor: principal.subjectId, publishedPlanDigest: draft.compiledPlan.planDigest });
     } catch (error) {
+      if (error instanceof SeparationOfDutiesError) throw error;
       return reply.code(409).send({ error: error instanceof Error ? error.message : "authoring.publish_failed" });
     }
   });
@@ -378,27 +385,31 @@ export function buildControlApi(options: ControlApiOptions = {}) {
   });
 
   app.get("/v1/runs", async (request) => {
-    await requirePrincipal(request, "run.read", { kind: "run" });
-    return { runs: await listRuns(db) };
+    const principal = await requirePrincipal(request, "run.read", { kind: "run" });
+    return { runs: await listRuns(db, principal.tenantId) };
   });
   app.post("/v1/runs", async (request, reply) => {
-    await requirePrincipal(request, "run.start", { kind: "run" });
+    const principal = await requirePrincipal(request, "run.start", { kind: "run" });
     const parsed = runRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "run.request_invalid", issues: parsed.error.issues });
-    if (!await getPlan(db, parsed.data.planDigest)) return reply.code(404).send({ error: "plan.not_found" });
+    // Scoped read: a plan admitted in another tenant is not startable here.
+    if (!await getPlan(db, parsed.data.planDigest, principal.tenantId)) return reply.code(404).send({ error: "plan.not_found" });
     const key = String(request.headers["idempotency-key"] ?? "");
     if (!key) return reply.code(400).send({ error: "run.idempotency_key_required" });
-    const result = await createRun(db, { planDigest: parsed.data.planDigest, runInput: parsed.data.input, idempotencyKey: key });
+    const result = await createRun(db, {
+      planDigest: parsed.data.planDigest, runInput: parsed.data.input, idempotencyKey: key,
+      tenantId: principal.tenantId,
+    });
     return reply.code(result.created ? 202 : 200).send(result);
   });
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId", async (request, reply) => {
-    await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
-    const run = await getRun(db, request.params.runId);
+    const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
+    const run = await getRun(db, request.params.runId, principal.tenantId);
     return run ?? reply.code(404).send({ error: "run.not_found" });
   });
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId/trace", async (request, reply) => {
-    await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
-    const run = await getRun(db, request.params.runId);
+    const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
+    const run = await getRun(db, request.params.runId, principal.tenantId);
     if (!run) return reply.code(404).send({ error: "run.not_found" });
     if (!run.traceId || !run.rootSpanId) return reply.code(404).send({ error: "trace.not_bound" });
     const base = process.env.TRACE_VIEWER_BASE_URL?.replace(/\/$/, "");
@@ -414,8 +425,8 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     return { events: await listEvents(db, request.params.runId, Number(request.query.after ?? 0)) };
   });
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId/attempts", async (request, reply) => {
-    await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
-    if (!await getRun(db, request.params.runId)) return reply.code(404).send({ error: "run.not_found" });
+    const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
+    if (!await getRun(db, request.params.runId, principal.tenantId)) return reply.code(404).send({ error: "run.not_found" });
     return { attempts: await listNodeAttempts(db, request.params.runId) };
   });
   app.get<{ Querystring: { runId?: string; decision?: string; limit?: string } }>("/v1/gateway/receipts", async (request, reply) => {

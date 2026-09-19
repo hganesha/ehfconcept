@@ -24,7 +24,7 @@ function recordingDatabase(): { db: Database; queries: unknown[] } {
 describe("plan admission", () => {
   it("admits a plan whose content matches its digest", async () => {
     const { db, queries } = recordingDatabase();
-    const result = await admitPlan(db, fixturePlan());
+    const result = await admitPlan(db, fixturePlan(), "tenant_demo");
     expect(result.created).toBe(true);
     expect(queries).toHaveLength(1);
   });
@@ -32,7 +32,7 @@ describe("plan admission", () => {
   it("rejects a tampered plan before touching the database", async () => {
     const { db, queries } = recordingDatabase();
     const tampered = { ...fixturePlan(), budgets: { ...fixturePlan().budgets, maxCostUsd: 999 } };
-    await expect(admitPlan(db, tampered)).rejects.toThrow("plan.digest_invalid");
+    await expect(admitPlan(db, tampered, "tenant_demo")).rejects.toThrow("plan.digest_invalid");
     // The regression this guards: admission used to insert first and validate after,
     // which left an unverifiable plan admitted and executable behind a 400 response.
     expect(queries).toHaveLength(0);

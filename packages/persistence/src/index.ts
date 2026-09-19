@@ -85,7 +85,7 @@ const runColumns = `run_id, idempotency_key, plan_digest, status, terminal_outco
   fencing_epoch, latest_checkpoint_id, current_node_id, error_code, trace_id, root_span_id, trace_flags, cost_usd, cost_complete, model_calls,
   capability_calls, created_at, started_at, completed_at, updated_at`;
 
-export async function admitPlan(db: Database, input: unknown): Promise<{ created: boolean; plan: HarnessPlan }> {
+export async function admitPlan(db: Database, input: unknown, tenantId: string): Promise<{ created: boolean; plan: HarnessPlan }> {
   const plan = harnessPlanSchema.parse(input);
   // Admission is the only gate between an arbitrary document and something the
   // dispatcher will execute and the gateway will treat as authority. Recompute the
@@ -94,33 +94,44 @@ export async function admitPlan(db: Database, input: unknown): Promise<{ created
   // envelopes, capability resolution, case-command authority -- keys off that digest.
   if (!verifyPlanDigest(plan)) throw new Error("plan.digest_invalid");
   const result = await db.query(`
-    insert into harness_control.plans(plan_digest, plan_id, name, domain, version, plan)
-    values ($1, $2, $3, $4, $5, $6::jsonb)
+    insert into harness_control.plans(plan_digest, plan_id, name, domain, version, plan, tenant_id)
+    values ($1, $2, $3, $4, $5, $6::jsonb, $7)
     on conflict (plan_digest) do nothing
-  `, [plan.planDigest, plan.planId, plan.metadata.name, plan.metadata.domain, plan.metadata.version, JSON.stringify(plan)]);
+  `, [plan.planDigest, plan.planId, plan.metadata.name, plan.metadata.domain, plan.metadata.version, JSON.stringify(plan), tenantId]);
   return { created: (result.rowCount ?? 0) > 0, plan };
 }
 
-export async function getPlan(db: Database, digest: string): Promise<HarnessPlan | null> {
-  const result = await db.query<{ plan: unknown }>(
-    "select plan from harness_control.plans where plan_digest = $1",
-    [digest],
-  );
+/**
+ * Read an admitted plan.
+ *
+ * `tenantId` scopes the read to a caller's assignment. It is omitted by components
+ * acting on behalf of a run that has already been authorized -- the gateway verifying an
+ * envelope, the dispatcher executing a claimed run -- where the plan digest itself is
+ * the authority and there is no caller tenant to check against.
+ */
+export async function getPlan(db: Database, digest: string, tenantId?: string): Promise<HarnessPlan | null> {
+  const result = tenantId
+    ? await db.query<{ plan: unknown }>(
+      "select plan from harness_control.plans where plan_digest = $1 and tenant_id = $2", [digest, tenantId])
+    : await db.query<{ plan: unknown }>(
+      "select plan from harness_control.plans where plan_digest = $1", [digest]);
   return result.rows[0] ? harnessPlanSchema.parse(result.rows[0].plan) : null;
 }
 
-export async function listPlans(db: Database): Promise<HarnessPlan[]> {
+export async function listPlans(db: Database, tenantId: string): Promise<HarnessPlan[]> {
   const result = await db.query<{ plan: unknown }>(
-    "select plan from harness_control.plans order by admitted_at desc limit 100",
+    "select plan from harness_control.plans where tenant_id = $1 order by admitted_at desc limit 100",
+    [tenantId],
   );
   return result.rows.map((row) => harnessPlanSchema.parse(row.plan));
 }
 
 export type PlanRecord = { plan: HarnessPlan; admittedAt: string };
 
-export async function listPlanRecords(db: Database): Promise<PlanRecord[]> {
+export async function listPlanRecords(db: Database, tenantId: string): Promise<PlanRecord[]> {
   const result = await db.query<{ plan: unknown; admitted_at: Date }>(
-    "select plan, admitted_at from harness_control.plans order by admitted_at desc limit 100",
+    "select plan, admitted_at from harness_control.plans where tenant_id = $1 order by admitted_at desc limit 100",
+    [tenantId],
   );
   return result.rows.map((row) => ({
     plan: harnessPlanSchema.parse(row.plan),
@@ -130,32 +141,33 @@ export async function listPlanRecords(db: Database): Promise<PlanRecord[]> {
 
 export async function createRun(
   db: Database,
-  input: { planDigest: string; runInput: unknown; idempotencyKey: string },
+  input: { planDigest: string; runInput: unknown; idempotencyKey: string; tenantId: string },
 ): Promise<{ created: boolean; run: RunRecord }> {
   const runId = `RUN-${randomUUID()}`;
   const result = await db.query<RunRow>(`
-    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input)
-    values ($1, $2, $3, 'queued', $4::jsonb)
+    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input, tenant_id)
+    values ($1, $2, $3, 'queued', $4::jsonb, $5)
     on conflict (idempotency_key) do update set updated_at = harness_runtime.runs.updated_at
     returning ${runColumns}
-  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput)]);
+  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput), input.tenantId]);
   const row = result.rows[0];
   if (!row) throw new Error("run.create_failed");
   return { created: row.run_id === runId, run: mapRun(row) };
 }
 
-export async function getRun(db: Database, runId: string): Promise<RunRecord | null> {
-  const result = await db.query<RunRow>(
-    `select ${runColumns} from harness_runtime.runs where run_id = $1`,
-    [runId],
-  );
+export async function getRun(db: Database, runId: string, tenantId?: string): Promise<RunRecord | null> {
+  const result = tenantId
+    ? await db.query<RunRow>(
+      `select ${runColumns} from harness_runtime.runs where run_id = $1 and tenant_id = $2`, [runId, tenantId])
+    : await db.query<RunRow>(
+      `select ${runColumns} from harness_runtime.runs where run_id = $1`, [runId]);
   return result.rows[0] ? mapRun(result.rows[0]) : null;
 }
 
-export async function listRuns(db: Database, limit = 100): Promise<RunRecord[]> {
+export async function listRuns(db: Database, tenantId: string, limit = 100): Promise<RunRecord[]> {
   const result = await db.query<RunRow>(
-    `select ${runColumns} from harness_runtime.runs order by updated_at desc limit $1`,
-    [Math.max(1, Math.min(100, limit))],
+    `select ${runColumns} from harness_runtime.runs where tenant_id = $1 order by updated_at desc limit $2`,
+    [tenantId, Math.max(1, Math.min(100, limit))],
   );
   return result.rows.map(mapRun);
 }
@@ -665,17 +677,17 @@ const authoringColumns = `draft_id, name, domain, version, status, revision, pac
 export async function createAuthoringDraft(db: Database, input: {
   packageSource: string; workflowSource: string; parsedPackage: Record<string, unknown>;
   parsedWorkflow: Record<string, unknown>; name: string; domain: string; version: string;
-  diagnostics: AuthoringDiagnostic[]; actor: string;
+  diagnostics: AuthoringDiagnostic[]; actor: string; tenantId: string;
 }): Promise<AuthoringDraftRecord> {
   const draftId = `draft_${randomUUID()}`;
   const result = await db.query<AuthoringDraftRow>(`
     insert into harness_control.authoring_drafts(
       draft_id, name, domain, version, status, package_source, workflow_source,
-      parsed_package, parsed_workflow, diagnostics
-    ) values ($1, $2, $3, $4, 'DRAFT', $5, $6, $7::jsonb, $8::jsonb, $9::jsonb)
+      parsed_package, parsed_workflow, diagnostics, tenant_id
+    ) values ($1, $2, $3, $4, 'DRAFT', $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10)
     returning ${authoringColumns}
   `, [draftId, input.name, input.domain, input.version, input.packageSource, input.workflowSource,
-    JSON.stringify(input.parsedPackage), JSON.stringify(input.parsedWorkflow), JSON.stringify(input.diagnostics)]);
+    JSON.stringify(input.parsedPackage), JSON.stringify(input.parsedWorkflow), JSON.stringify(input.diagnostics), input.tenantId]);
   await db.query(`insert into harness_control.authoring_events(event_id, draft_id, revision, event_type, actor, details)
     values ($1, $2, 1, 'draft.created', $3, $4::jsonb)`,
   [`evt_${randomUUID()}`, draftId, input.actor, JSON.stringify({ source: "authoring-plane" })]);
@@ -684,14 +696,42 @@ export async function createAuthoringDraft(db: Database, input: {
   return mapAuthoringDraft(row);
 }
 
-export async function listAuthoringDrafts(db: Database): Promise<AuthoringDraftRecord[]> {
-  const result = await db.query<AuthoringDraftRow>(`select ${authoringColumns} from harness_control.authoring_drafts order by updated_at desc limit 100`);
+export async function listAuthoringDrafts(db: Database, tenantId: string): Promise<AuthoringDraftRecord[]> {
+  const result = await db.query<AuthoringDraftRow>(
+    `select ${authoringColumns} from harness_control.authoring_drafts where tenant_id = $1 order by updated_at desc limit 100`,
+    [tenantId],
+  );
   return result.rows.map(mapAuthoringDraft);
 }
 
-export async function getAuthoringDraft(db: Database, draftId: string): Promise<AuthoringDraftRecord | null> {
-  const result = await db.query<AuthoringDraftRow>(`select ${authoringColumns} from harness_control.authoring_drafts where draft_id = $1`, [draftId]);
+export async function getAuthoringDraft(db: Database, draftId: string, tenantId?: string): Promise<AuthoringDraftRecord | null> {
+  const result = tenantId
+    ? await db.query<AuthoringDraftRow>(
+      `select ${authoringColumns} from harness_control.authoring_drafts where draft_id = $1 and tenant_id = $2`, [draftId, tenantId])
+    : await db.query<AuthoringDraftRow>(
+      `select ${authoringColumns} from harness_control.authoring_drafts where draft_id = $1`, [draftId]);
   return result.rows[0] ? mapAuthoringDraft(result.rows[0]) : null;
+}
+
+/**
+ * Actors who shaped this draft's content.
+ *
+ * Read from the authoring event log rather than a denormalized column, so the check and
+ * the audit trail cannot disagree. Lifecycle transitions that only observe the draft --
+ * evaluation, approval, publication -- are not authorship.
+ */
+export async function authoringContributors(db: Database, draftId: string): Promise<string[]> {
+  const result = await db.query<{ actor: string }>(`
+    select distinct actor from harness_control.authoring_events
+    where draft_id = $1 and event_type in ('draft.created', 'draft.updated', 'draft.compiled')
+  `, [draftId]);
+  return result.rows.map((row) => row.actor);
+}
+
+export class SeparationOfDutiesError extends Error {
+  constructor(readonly actor: string) {
+    super("authoring.separation_of_duties");
+  }
 }
 
 export async function updateAuthoringSources(db: Database, draftId: string, input: {
@@ -720,6 +760,14 @@ export async function setAuthoringLifecycle(db: Database, draftId: string, input
   expectedStatus: AuthoringStatus; status: AuthoringStatus; actor: string; compiledPlan?: HarnessPlan;
   diagnostics?: AuthoringDiagnostic[]; evaluationReport?: EvaluationReport; publishedPlanDigest?: string;
 }): Promise<AuthoringDraftRecord> {
+  // approved_by used to be recorded and never compared with anything, so a single
+  // identity could author, evaluate, approve and publish its own plan. Approval and
+  // publication are the two transitions that confer authority on a plan, so they are the
+  // two that an author may not perform.
+  if (input.status === "APPROVED" || input.status === "PUBLISHED") {
+    const contributors = await authoringContributors(db, draftId);
+    if (contributors.includes(input.actor)) throw new SeparationOfDutiesError(input.actor);
+  }
   const result = await db.query<AuthoringDraftRow>(`
     update harness_control.authoring_drafts
     set status=$3,
@@ -727,6 +775,7 @@ export async function setAuthoringLifecycle(db: Database, draftId: string, input
         diagnostics=coalesce($5::jsonb, diagnostics),
         evaluation_report=coalesce($6::jsonb, evaluation_report),
         approved_by=case when $3='APPROVED' then $7 else approved_by end,
+        published_by=case when $3='PUBLISHED' then $7 else published_by end,
         published_plan_digest=coalesce($8, published_plan_digest),
         updated_at=now()
     where draft_id=$1 and status=$2
