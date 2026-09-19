@@ -28,6 +28,14 @@ import {
 } from "./authoring.js";
 import { importAgentBundle } from "./agent-import.js";
 import { EnvelopeBrokerError, issueExecutionEnvelope } from "./envelope-broker.js";
+import {
+  applyStateWrite,
+  authorizeStateWrite,
+  parseStateRequest,
+  RuntimeStateAuthorityError,
+  runtimeStateOperations,
+  type RuntimeStateOperation,
+} from "./runtime-state-routes.js";
 import { applyAgentToAuthoringSources, materializeRegisteredContracts, updateNodeCaseWrites } from "./authoring-agents.js";
 
 function serviceGrantsFromEnv(env: NodeJS.ProcessEnv): ServiceTokenGrant[] {
@@ -342,6 +350,30 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     } catch (error) {
       if (error instanceof EnvelopeBrokerError) return reply.code(error.httpStatus).send({ error: error.code });
       return reply.code(400).send({ error: error instanceof Error ? error.message : "broker.request_invalid" });
+    }
+  });
+
+  // Private journalling surface. The runtime describes what happened; the control plane
+  // re-checks the lease and fence and decides whether to record it, so the runtime needs
+  // no database credential of its own.
+  app.post<{ Params: { operation: string } }>("/v1/runtime/state/:operation", async (request, reply) => {
+    await runtimeGuard.require(request, "runtime.state.write", { kind: "run" });
+    const operation = request.params.operation as RuntimeStateOperation;
+    if (!runtimeStateOperations.includes(operation)) return reply.code(404).send({ error: "runtime_state.operation_unknown" });
+    const header = request.headers["x-runtime-grant"];
+    const grant = (Array.isArray(header) ? header[0] : header)?.trim();
+    try {
+      const { run, payload } = parseStateRequest(operation, request.body);
+      await authorizeStateWrite(db, grant, grantSecret(), run);
+      await applyStateWrite(db, operation, run, payload);
+      return reply.code(204).send();
+    } catch (error) {
+      if (error instanceof RuntimeStateAuthorityError) return reply.code(error.httpStatus).send({ error: error.code });
+      if (error instanceof EnvelopeBrokerError) return reply.code(error.httpStatus).send({ error: error.code });
+      const message = error instanceof Error ? error.message : "runtime_state.request_invalid";
+      // A fenced write that lost its race is a denial, not a server fault.
+      if (message.includes("stale_fence")) return reply.code(403).send({ error: message });
+      return reply.code(400).send({ error: message });
     }
   });
 

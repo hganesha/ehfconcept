@@ -7,13 +7,7 @@ import {
   type HarnessPlan,
   type CapabilityResult,
 } from "@ehf/contracts";
-import {
-  appendEvent,
-  beginNodeAttempt,
-  finishNodeAttempt,
-  updateRunNode,
-  type Database,
-} from "@ehf/persistence";
+import type { FencedRun, RuntimeStateStore } from "@ehf/runtime-state";
 import {
   SpanKind,
   injectTraceContext,
@@ -22,7 +16,11 @@ import {
 } from "@ehf/telemetry";
 
 export type RuntimeContext = {
-  db: Database;
+  /**
+   * Durable journal. The runtime describes what happened and the control plane decides
+   * whether to record it; the runtime holds no database credential of its own.
+   */
+  state: RuntimeStateStore;
   plan: HarnessPlan;
   runId: string;
   runAttempt: number;
@@ -407,8 +405,7 @@ export async function executeCaseWrites(
       headers: executionHeaders,
       body: JSON.stringify(command),
     });
-    await appendEvent(context.db, {
-      runId: context.runId,
+    await context.state.appendEvent(fencedRun(context), {
       eventKey: `case-write:${nodeId}:${context.runAttempt}:${index}`,
       code: "case.write.completed",
       nodeId,
@@ -418,6 +415,16 @@ export async function executeCaseWrites(
   }
 }
 
+/** Identity of the fenced attempt this runtime is journaling under. */
+export function fencedRun(context: RuntimeContext): FencedRun {
+  return {
+    runId: context.runId,
+    attempt: context.runAttempt,
+    workerId: context.workerId,
+    fencingEpoch: context.fencingEpoch,
+  };
+}
+
 export async function executeObservedNode<T>(
   context: RuntimeContext,
   nodeId: string,
@@ -425,6 +432,7 @@ export async function executeObservedNode<T>(
   execute: () => Promise<T>,
 ): Promise<T> {
   const node = context.plan.graph.nodes.find((item) => item.id === nodeId);
+  const run = fencedRun(context);
   return withSpan("workflow.transition", {
     kind: SpanKind.INTERNAL,
     attributes: {
@@ -437,33 +445,32 @@ export async function executeObservedNode<T>(
     },
   }, async (span) => {
     const spanRef = traceReference(span);
-    await updateRunNode(context.db, {
-      runId: context.runId, workerId: context.workerId,
-      fencingEpoch: context.fencingEpoch, nodeId,
+    // Only digests cross this boundary: the journal records that a node ran and what its
+    // input and output hashed to, never the values themselves.
+    await context.state.nodeStarted(run, {
+      nodeId,
+      inputDigest: stableDigest(input),
+      traceId: spanRef.traceId,
+      spanId: spanRef.spanId,
     });
-    await beginNodeAttempt(context.db, {
-      runId: context.runId, nodeId, attempt: context.runAttempt,
-      fencingEpoch: context.fencingEpoch, value: input,
-      traceId: spanRef.traceId, spanId: spanRef.spanId,
-    });
-    await appendEvent(context.db, {
-      runId: context.runId, eventKey: `node:${nodeId}:${context.runAttempt}:started`,
+    await context.state.appendEvent(run, {
+      eventKey: `node:${nodeId}:${context.runAttempt}:started`,
       code: "node.started", nodeId, status: "observed", values: {},
     });
     try {
       const result = await execute();
       span.setAttribute("harness.outcome", "COMPLETED");
-      await finishNodeAttempt(context.db, { runId: context.runId, nodeId, attempt: context.runAttempt, status: "completed", value: result });
-      await appendEvent(context.db, {
-        runId: context.runId, eventKey: `node:${nodeId}:${context.runAttempt}:completed`,
+      await context.state.nodeFinished(run, { nodeId, status: "completed", outputDigest: stableDigest(result) });
+      await context.state.appendEvent(run, {
+        eventKey: `node:${nodeId}:${context.runAttempt}:completed`,
         code: "node.completed", nodeId, status: "passed", values: {},
       });
       return result;
     } catch (error) {
       const code = error instanceof Error ? error.message : "runtime.node_failed";
-      await finishNodeAttempt(context.db, { runId: context.runId, nodeId, attempt: context.runAttempt, status: "failed", errorCode: code });
-      await appendEvent(context.db, {
-        runId: context.runId, eventKey: `node:${nodeId}:${context.runAttempt}:failed`,
+      await context.state.nodeFinished(run, { nodeId, status: "failed", errorCode: code });
+      await context.state.appendEvent(run, {
+        eventKey: `node:${nodeId}:${context.runAttempt}:failed`,
         code: "node.failed", nodeId, status: "failed", values: { errorCode: code },
       });
       throw error;

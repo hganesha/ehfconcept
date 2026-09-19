@@ -112,12 +112,15 @@ services:
 
   runtime-host-local:
     build: .
-    # Holds no envelope signing key: it exchanges the dispatcher's grant for a per-node
-    # envelope at the control plane, which re-checks the lease and fence first.
+    # Holds no envelope signing key and no run journal credential: it exchanges the
+    # dispatcher's grant for a per-node envelope at the control plane, and journals
+    # through it too. The only database handle left is the LangGraph checkpoint store,
+    # which RUNTIME_CHECKPOINT_BACKEND=memory removes entirely at the cost of resumability.
     # Invoke the checked-in runtime directly so the read-only container never
     # asks pnpm to repair or relink the workspace at startup.
     command: ./node_modules/.bin/tsx apps/runtime-host/src/server.ts
     environment:
+      RUNTIME_CHECKPOINT_BACKEND: ${RUNTIME_CHECKPOINT_BACKEND:-postgres}
       RUNTIME_CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
       RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
       RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}

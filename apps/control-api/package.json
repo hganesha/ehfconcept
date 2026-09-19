@@ -15,7 +15,9 @@
     "@ehf/execution-auth": "workspace:*",
     "@ehf/identity": "workspace:*",
     "@ehf/persistence": "workspace:*",
+    "@ehf/runtime-state": "workspace:*",
     "fastify": "5.12.5",
-    "yaml": "2.9.1"
+    "yaml": "2.9.1",
+    "zod": "4.6.5"
   }
 }

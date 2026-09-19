@@ -55,7 +55,12 @@ describe("capability invocation authority", () => {
 
   function context(): RuntimeContext {
     return {
-      db: null as unknown as RuntimeContext["db"],
+      state: {
+        nodeStarted: async () => {},
+        nodeFinished: async () => {},
+        appendEvent: async () => {},
+        markCheckpoint: async () => {},
+      },
       plan,
       runId: "RUN-1",
       runAttempt: 2,

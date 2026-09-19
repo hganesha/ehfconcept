@@ -1,20 +1,21 @@
-import type { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
+import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import {
   runtimeInvocationSchema,
-  type RuntimeInvocation,
   type RuntimeInvocationResult,
 } from "@ehf/contracts";
-import { updateRunNode, type Database } from "@ehf/persistence";
 import { lowerHarnessPlan } from "@ehf/runtime-langgraph";
+import { HttpRuntimeStateStore, type RuntimeStateStore } from "@ehf/runtime-state";
 
 export type RuntimeExecutorDependencies = {
-  db: Database;
-  saver: PostgresSaver;
+  /** Optional: absent when the deployment runs without a resumable checkpoint backend. */
+  saver?: BaseCheckpointSaver;
   gatewayUrl: string;
   caseApiUrl?: string;
-  envelopeBrokerUrl: string;
+  controlPlaneUrl: string;
   serviceToken: string;
   providerMetadata?: Record<string, string>;
+  /** Overridable so contract tests can drive a Postgres-backed store directly. */
+  createStateStore?: (grant: string) => RuntimeStateStore;
 };
 
 export async function executeRuntimeInvocation(
@@ -25,8 +26,19 @@ export async function executeRuntimeInvocation(
   const remainingMs = new Date(request.deadlineAt).getTime() - Date.now();
   if (remainingMs <= 0) throw new Error("runtime.deadline_exceeded");
   const timeoutMs = Math.min(remainingMs, request.plan.budgets.maxDurationMs);
+  const state = dependencies.createStateStore?.(request.executionGrant) ?? new HttpRuntimeStateStore({
+    baseUrl: dependencies.controlPlaneUrl,
+    serviceToken: dependencies.serviceToken,
+    executionGrant: request.executionGrant,
+  });
+  const fenced = {
+    runId: request.runId,
+    attempt: request.attempt,
+    workerId: request.workerId,
+    fencingEpoch: request.fencingEpoch,
+  };
   const compiled = lowerHarnessPlan(request.plan, {
-    db: dependencies.db,
+    state,
     plan: request.plan,
     runId: request.runId,
     runAttempt: request.attempt,
@@ -34,9 +46,7 @@ export async function executeRuntimeInvocation(
     fencingEpoch: request.fencingEpoch,
     gatewayUrl: dependencies.gatewayUrl,
     ...(dependencies.caseApiUrl ? { caseApiUrl: dependencies.caseApiUrl } : {}),
-    envelopeBrokerUrl: dependencies.envelopeBrokerUrl,
-    // The grant travels with the invocation and is scoped to it; the runtime never holds
-    // a durable credential that could authorize a different run.
+    envelopeBrokerUrl: dependencies.controlPlaneUrl,
     executionGrant: request.executionGrant,
     serviceToken: dependencies.serviceToken,
   }, dependencies.saver);
@@ -47,17 +57,11 @@ export async function executeRuntimeInvocation(
       maxConcurrency: request.plan.execution.maxConcurrency,
       signal: AbortSignal.timeout(timeoutMs),
     });
-    const checkpoint = await dependencies.saver.getTuple({
+    const checkpoint = await dependencies.saver?.getTuple({
       configurable: { thread_id: request.runId, checkpoint_ns: request.planDigest },
     });
     const checkpointId = checkpoint?.checkpoint.id ?? null;
-    await updateRunNode(dependencies.db, {
-      runId: request.runId,
-      workerId: request.workerId,
-      fencingEpoch: request.fencingEpoch,
-      nodeId: null,
-      checkpointId,
-    });
+    await state.markCheckpoint(fenced, { checkpointId, nodeId: null });
     return {
       contractVersion: "runtime.result.v1",
       invocationId: request.invocationId,
