@@ -46,6 +46,7 @@ services:
       # are present; managed-identity Entra tokens replace them.
       EDGE_SERVICE_TOKEN: ${EDGE_SERVICE_TOKEN:-local-edge-service-token-change-before-sharing}
       RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}
+      RUNTIME_GRANT_SECRET: ${RUNTIME_GRANT_SECRET:-local-runtime-grant-secret-change-before-share}
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,6 +57,7 @@ services:
     environment:
       <<: *runtime-env
       CONTROL_API_PORT: "4100"
+      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
     ports:
       - "4100:4100"
     depends_on:
@@ -109,15 +111,17 @@ services:
 
   runtime-host-local:
     build: .
+    # Holds no envelope signing key: it exchanges the dispatcher's grant for a per-node
+    # envelope at the control plane, which re-checks the lease and fence first.
     # Invoke the checked-in runtime directly so the read-only container never
     # asks pnpm to repair or relink the workspace at startup.
     command: ./node_modules/.bin/tsx apps/runtime-host/src/server.ts
     environment:
       RUNTIME_CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
       RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
-      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
       RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}
       PLATFORM_MODE: ${PLATFORM_MODE:-local}
+      ENVELOPE_BROKER_URL: http://control-api:4100
       CAPABILITY_GATEWAY_URL: http://capability-gateway:4101
       CASE_API_URL: http://case-api:4102
       RUNTIME_HOST_PORT: "8088"
@@ -132,6 +136,8 @@ services:
       capability-gateway:
         condition: service_healthy
       case-api:
+        condition: service_healthy
+      control-api:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully

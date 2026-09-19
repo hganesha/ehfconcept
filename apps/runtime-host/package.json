@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ehf/contracts": "workspace:*",
+    "@ehf/identity": "workspace:*",
     "@ehf/persistence": "workspace:*",
     "@ehf/runtime-langgraph": "workspace:*",
     "@ehf/telemetry": "workspace:*",

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ehf/contracts": "workspace:*",
+    "@ehf/execution-auth": "workspace:*",
     "@ehf/identity": "workspace:*",
     "@ehf/persistence": "workspace:*",
     "fastify": "5.12.5",

@@ -1,6 +1,7 @@
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { createDatabase } from "@ehf/persistence";
 import { initializeTelemetry } from "@ehf/telemetry";
+import { assertPlatformInvariants } from "@ehf/identity";
 import { buildRuntimeHost } from "./app.js";
 import { executeRuntimeInvocation } from "./executor.js";
 
@@ -9,6 +10,14 @@ function requiredEnv(name: string, error: string): string {
   if (!value) throw new Error(error);
   return value;
 }
+
+// The runtime must not hold an envelope signing key in any mode; in Azure it must not
+// hold a static service token or database credential either.
+if (process.env.EXECUTION_ENVELOPE_SECRET) throw new Error("runtime.envelope_secret_forbidden");
+assertPlatformInvariants({
+  forbidden: ["RUNTIME_SERVICE_TOKEN", "RUNTIME_HOST_AUTH_TOKEN", "RUNTIME_CHECKPOINT_DATABASE_URL"],
+  databaseUrls: ["RUNTIME_CHECKPOINT_DATABASE_URL"],
+});
 
 const telemetry = initializeTelemetry({ serviceName: "harness-runtime-host" });
 const connectionString = requiredEnv("RUNTIME_CHECKPOINT_DATABASE_URL", "runtime.checkpoint_database_url_missing");
@@ -23,7 +32,7 @@ const app = buildRuntimeHost({
     saver,
     gatewayUrl: process.env.CAPABILITY_GATEWAY_URL ?? "http://capability-gateway:4101",
     caseApiUrl: process.env.CASE_API_URL ?? "http://case-api:4102",
-    executionSecret: requiredEnv("EXECUTION_ENVELOPE_SECRET", "execution_auth.secret_missing"),
+    envelopeBrokerUrl: process.env.ENVELOPE_BROKER_URL ?? "http://control-api:4100",
     serviceToken: requiredEnv("RUNTIME_SERVICE_TOKEN", "runtime.service_token_missing"),
     providerMetadata: {
       host: "local_http",

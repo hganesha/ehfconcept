@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ehf/contracts": "workspace:*",
+    "@ehf/execution-auth": "workspace:*",
     "@ehf/persistence": "workspace:*",
     "@ehf/runtime-provider": "workspace:*",
     "@ehf/telemetry": "workspace:*",

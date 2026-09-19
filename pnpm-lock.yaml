@@ -74,6 +74,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/execution-auth':
+        specifier: workspace:*
+        version: link:../../packages/execution-auth
       '@ehf/identity':
         specifier: workspace:*
         version: link:../../packages/identity
@@ -129,6 +132,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
@@ -150,6 +156,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/execution-auth':
+        specifier: workspace:*
+        version: link:../../packages/execution-auth
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence

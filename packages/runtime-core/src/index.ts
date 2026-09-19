@@ -7,7 +7,6 @@ import {
   type HarnessPlan,
   type CapabilityResult,
 } from "@ehf/contracts";
-import { mintExecutionEnvelope } from "@ehf/execution-auth";
 import {
   appendEvent,
   beginNodeAttempt,
@@ -31,7 +30,13 @@ export type RuntimeContext = {
   fencingEpoch: number;
   gatewayUrl: string;
   caseApiUrl?: string;
-  executionSecret: string;
+  /** Control-plane endpoint that exchanges the runtime grant for a node-scoped envelope. */
+  envelopeBrokerUrl: string;
+  /**
+   * Authority for this invocation, issued by the dispatcher. The runtime holds no signing
+   * key: it cannot mint an envelope, only ask for one and be refused.
+   */
+  executionGrant: string;
   /**
    * Credential proving which workload is calling the internal services. It answers a
    * different question than the execution envelope, which says what this run, node and
@@ -39,6 +44,42 @@ export type RuntimeContext = {
    */
   serviceToken: string;
 };
+
+type IssuedEnvelope = { envelope: string; expiresInSeconds: number; caseWrites: string[] };
+
+/**
+ * Ask the control plane for authority to act as one node of this run.
+ *
+ * Every call re-derives the grant against durable run state, so an envelope cannot
+ * outlive the lease it was issued under.
+ */
+async function requestExecutionEnvelope(
+  context: RuntimeContext,
+  nodeId: string,
+  invocationId: string,
+): Promise<IssuedEnvelope> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${context.serviceToken}`,
+    "x-runtime-grant": context.executionGrant,
+    "content-type": "application/json",
+  };
+  injectTraceContext(headers);
+  const response = await fetch(`${context.envelopeBrokerUrl}/v1/runtime/envelopes`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ runId: context.runId, nodeId, attempt: context.runAttempt, invocationId }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body = await response.json() as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(body.error ?? "runtime.envelope_denied"));
+  const envelope = typeof body.envelope === "string" ? body.envelope : "";
+  if (!envelope) throw new Error("runtime.envelope_invalid");
+  return {
+    envelope,
+    expiresInSeconds: Number(body.expiresInSeconds ?? 0),
+    caseWrites: Array.isArray(body.caseWrites) ? body.caseWrites.map(String) : [],
+  };
+}
 
 type CaseWriteScope = {
   case: Record<string, unknown>;
@@ -178,18 +219,7 @@ export async function invokeCapability(
   // Stable across worker crashes so a resumed checkpoint replays the gateway receipt
   // instead of repeating a paid or externally-visible operation.
   const invocationId = `${context.runId}:${nodeId}:${stableDigest(input).slice(0, 24)}`;
-  const token = await mintExecutionEnvelope({
-    secret: context.executionSecret,
-    invocationId,
-    runId: context.runId,
-    nodeId,
-    attempt: context.runAttempt,
-    planDigest: context.plan.planDigest,
-    permissionDigest: permission.digest,
-    capabilities: permission.capabilities,
-    effects: permission.effects,
-    fencingEpoch: context.fencingEpoch,
-  });
+  const issued = await requestExecutionEnvelope(context, nodeId, invocationId);
   return withSpan("capability.request", {
     kind: SpanKind.CLIENT,
     attributes: {
@@ -204,7 +234,7 @@ export async function invokeCapability(
   }, async (span) => {
     const headers: Record<string, string> = {
       authorization: `Bearer ${context.serviceToken}`,
-      "x-execution-envelope": token,
+      "x-execution-envelope": issued.envelope,
       "content-type": "application/json",
     };
     injectTraceContext(headers);

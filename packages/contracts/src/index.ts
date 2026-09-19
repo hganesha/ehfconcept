@@ -253,6 +253,8 @@ export const runtimeInvocationSchema = z.object({
   deadlineAt: z.string().datetime(),
   planDigest: z.string().regex(/^[a-f0-9]{64}$/),
   executionProfileDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  /** Short-lived, audience-bound authority for this invocation. Never a reusable secret. */
+  executionGrant: z.string().min(1),
   plan: harnessPlanSchema,
   input: z.unknown(),
 }).strict().superRefine((value, ctx) => {
@@ -374,9 +376,44 @@ export const executionEnvelopeClaimsSchema = z.object({
   permission_digest: z.string().regex(/^[a-f0-9]{64}$/),
   capabilities: z.array(z.string()),
   effects: z.array(effectClassSchema),
+  /**
+   * Canonical command types the plan declares this node may submit. The case service
+   * checks a command against this list, so a runtime cannot invent a case write the
+   * compiled plan never granted it.
+   */
+  case_writes: z.array(businessCommandTypeSchema).default([]),
   fencing_epoch: z.number().int().nonnegative(),
   iat: z.number().int(),
   exp: z.number().int(),
+}).strict();
+
+/**
+ * Authority the dispatcher hands to a runtime for the length of one invocation.
+ *
+ * The runtime used to hold the envelope signing secret and mint its own capability
+ * envelopes, which meant a compromised runtime -- in Azure, a hosted agent the platform
+ * does not control -- could grant itself any capability, effect, node or epoch it liked.
+ * It now receives this grant instead and exchanges it, per node, at the control plane,
+ * which re-checks the lease and fence before signing anything.
+ */
+export const runtimeGrantClaimsSchema = z.object({
+  iss: z.string().min(1),
+  aud: z.string().min(1),
+  jti: z.string().min(1),
+  run_id: z.string().min(1),
+  attempt: z.number().int().positive(),
+  worker_id: z.string().min(1),
+  plan_digest: z.string().regex(/^[a-f0-9]{64}$/),
+  fencing_epoch: z.number().int().positive(),
+  iat: z.number().int(),
+  exp: z.number().int(),
+}).strict();
+
+export const envelopeRequestSchema = z.object({
+  runId: z.string().min(1),
+  nodeId: z.string().min(1),
+  attempt: z.number().int().nonnegative(),
+  invocationId: z.string().min(1),
 }).strict();
 
 export const capabilityRequestSchema = z.object({
@@ -492,6 +529,8 @@ export type BusinessCommandType = z.infer<typeof businessCommandTypeSchema>;
 export type RegisterEvidenceRequest = z.infer<typeof registerEvidenceRequestSchema>;
 export type CommandOutcome = z.infer<typeof commandOutcomeSchema>;
 export type ExecutionEnvelopeClaims = z.infer<typeof executionEnvelopeClaimsSchema>;
+export type RuntimeGrantClaims = z.infer<typeof runtimeGrantClaimsSchema>;
+export type EnvelopeRequest = z.infer<typeof envelopeRequestSchema>;
 export type CapabilityRequest = z.infer<typeof capabilityRequestSchema>;
 export type CapabilityResult = z.infer<typeof capabilityResultSchema>;
 export type AuthoringStatus = z.infer<typeof authoringStatusSchema>;

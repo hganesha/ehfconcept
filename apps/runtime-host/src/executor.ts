@@ -12,7 +12,7 @@ export type RuntimeExecutorDependencies = {
   saver: PostgresSaver;
   gatewayUrl: string;
   caseApiUrl?: string;
-  executionSecret: string;
+  envelopeBrokerUrl: string;
   serviceToken: string;
   providerMetadata?: Record<string, string>;
 };
@@ -34,7 +34,10 @@ export async function executeRuntimeInvocation(
     fencingEpoch: request.fencingEpoch,
     gatewayUrl: dependencies.gatewayUrl,
     ...(dependencies.caseApiUrl ? { caseApiUrl: dependencies.caseApiUrl } : {}),
-    executionSecret: dependencies.executionSecret,
+    envelopeBrokerUrl: dependencies.envelopeBrokerUrl,
+    // The grant travels with the invocation and is scoped to it; the runtime never holds
+    // a durable credential that could authorize a different run.
+    executionGrant: request.executionGrant,
     serviceToken: dependencies.serviceToken,
   }, dependencies.saver);
   try {

@@ -9,6 +9,7 @@ import {
   getPlan,
   renewLease,
 } from "@ehf/persistence";
+import { mintRuntimeGrant } from "@ehf/execution-auth";
 import { createRuntimeProviderFromEnv } from "@ehf/runtime-provider";
 import {
   SpanKind,
@@ -29,6 +30,9 @@ function requiredEnv(name: string, error: string): string {
 }
 
 const connectionString = requiredEnv("DATABASE_URL", "database.url_missing");
+// The dispatcher owns the lease and the fence, so it is the only component that may
+// issue authority for an invocation. The runtime receives a grant, never a signing key.
+const grantSecret = requiredEnv("RUNTIME_GRANT_SECRET", "runtime.grant_secret_missing");
 const db = createDatabase(connectionString);
 const workerId = process.env.WORKER_ID ?? `${hostname()}:${process.pid}`;
 const leaseSeconds = Number(process.env.WORKER_LEASE_SECONDS ?? 60);
@@ -96,9 +100,21 @@ async function workOnce(): Promise<boolean> {
       void renewLease(db, run.runId, workerId, run.fencingEpoch, leaseSeconds);
     }, Math.max(1_000, Math.floor(leaseSeconds * 500)));
     try {
+      const invocationId = `INV-${stableDigest({ runId: run.runId, attempt: run.attempt, fencingEpoch: run.fencingEpoch }).slice(0, 32)}`;
+      const executionGrant = await mintRuntimeGrant({
+        secret: grantSecret,
+        grantId: invocationId,
+        runId: run.runId,
+        attempt: run.attempt,
+        workerId,
+        planDigest: run.planDigest,
+        fencingEpoch: run.fencingEpoch,
+        // Outlives the invocation deadline by a small margin and no more.
+        ttlSeconds: Math.ceil(plan.budgets.maxDurationMs / 1000) + 30,
+      });
       const invocation: RuntimeInvocation = {
         contractVersion: "runtime.invocation.v1",
-        invocationId: `INV-${stableDigest({ runId: run.runId, attempt: run.attempt, fencingEpoch: run.fencingEpoch }).slice(0, 32)}`,
+        invocationId,
         runId: claimedRun.runId,
         attempt: run.attempt,
         workerId,
@@ -107,6 +123,7 @@ async function workOnce(): Promise<boolean> {
         deadlineAt: new Date(Date.now() + plan.budgets.maxDurationMs).toISOString(),
         planDigest: run.planDigest,
         executionProfileDigest: provider.executionProfileDigest,
+        executionGrant,
         plan,
         input: run.input,
       };

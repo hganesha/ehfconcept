@@ -35,7 +35,7 @@
       "path": "package.yaml"
     },
     {
-      "digest": "e6974d8575f195f6ebb8f84f3092496b8c5e5b211db4c128434128b46ecfcdbc",
+      "digest": "4099a27d23af5efcea834262c21d8a15cc3831fa76b95ea14e79429144ebc535",
       "path": "workflow.yaml"
     }
   ],
@@ -113,11 +113,32 @@
       },
       {
         "config": {
+          "agentRef": "agent.vendor.v1",
           "aggregation": "",
           "body": [],
           "branches": [],
           "capabilityId": "vendor.lookup",
           "carry": {},
+          "caseWrites": [
+            {
+              "commandType": "LinkEvidence",
+              "payload": {
+                "evidenceRef": "{{ evidence.evidenceId }}"
+              },
+              "payloadSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "commandType": "ProposeClaim",
+              "payload": {
+                "claim": "{{ output.vendor }}"
+              },
+              "payloadSchema": {
+                "type": "object"
+              }
+            }
+          ],
           "defaultBranch": "",
           "entry": "",
           "execution": "",
@@ -132,6 +153,7 @@
           "onExhausted": "",
           "operation": "",
           "router": "",
+          "runtimeTarget": "local_http",
           "subgraph": null,
           "teacherModel": "",
           "threshold": null,
@@ -188,7 +210,7 @@
     "version": "0.1.0"
   },
   "modelProfiles": [],
-  "packageDigest": "e5c71e3f837f4de334e5109848b919f744ff0fcdf53b6eb63aab2e85889f815b",
+  "packageDigest": "2514c949034f08212b17f0efbb91015d88eb1cc26b3f0890c0bb3ffd1e7c5109",
   "permissionEnvelopes": [
     {
       "capabilities": [
@@ -201,8 +223,8 @@
       "nodeId": "lookup"
     }
   ],
-  "planDigest": "e51e7cf2c757986c1a55350172f0eb60865f15d98c0aed3ebbfc9d64d4f2c56b",
-  "planId": "cross-compiler-ordering@0.1.0:e51e7cf2c757",
+  "planDigest": "8da6c35a557217b1a54068dd27669bd657fa58bd8a26c7dc7d2c11759e6fd492",
+  "planId": "cross-compiler-ordering@0.1.0:8da6c35a5572",
   "schemas": {
     "input": {
       "properties": {

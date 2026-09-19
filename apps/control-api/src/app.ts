@@ -27,6 +27,7 @@ import {
   evaluateCompiledPlan,
 } from "./authoring.js";
 import { importAgentBundle } from "./agent-import.js";
+import { EnvelopeBrokerError, issueExecutionEnvelope } from "./envelope-broker.js";
 import { applyAgentToAuthoringSources, materializeRegisteredContracts, updateNodeCaseWrites } from "./authoring-agents.js";
 
 function serviceGrantsFromEnv(env: NodeJS.ProcessEnv): ServiceTokenGrant[] {
@@ -45,6 +46,8 @@ export type ControlApiOptions = {
   db?: Database;
   serviceGrants?: ServiceTokenGrant[];
   env?: NodeJS.ProcessEnv;
+  envelopeSecret?: string;
+  grantSecret?: string;
 };
 
 export function buildControlApi(options: ControlApiOptions = {}) {
@@ -75,6 +78,16 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     resource?: ResourceRef,
   ): Promise<Principal> => guard.require(request, action, resource);
   const profilesPath = env.MODEL_PROFILES_PATH ?? "config/model-profiles.json";
+  const envelopeSecret = () => {
+    const value = options.envelopeSecret ?? env.EXECUTION_ENVELOPE_SECRET;
+    if (!value) throw new EnvelopeBrokerError("broker.envelope_secret_missing", 503);
+    return value;
+  };
+  const grantSecret = () => {
+    const value = options.grantSecret ?? env.RUNTIME_GRANT_SECRET;
+    if (!value) throw new EnvelopeBrokerError("broker.grant_secret_missing", 503);
+    return value;
+  };
   const domainsPath = fileURLToPath(new URL("../../../domains/", import.meta.url));
   app.get("/v1/plans", async (request) => {
     await requirePrincipal(request, "plan.read", { kind: "plan" });
@@ -312,6 +325,26 @@ export function buildControlApi(options: ControlApiOptions = {}) {
       return reply.code(409).send({ error: error instanceof Error ? error.message : "authoring.publish_failed" });
     }
   });
+  // Private broker surface. The runtime holds no signing key; it presents the grant the
+  // dispatcher issued for this invocation and receives an envelope scoped to one node.
+  app.post("/v1/runtime/envelopes", async (request, reply) => {
+    await runtimeGuard.require(request, "envelope.mint", { kind: "run" });
+    const header = request.headers["x-runtime-grant"];
+    const grant = (Array.isArray(header) ? header[0] : header)?.trim();
+    if (!grant) return reply.code(401).send({ error: "broker.grant_missing" });
+    try {
+      return await issueExecutionEnvelope({
+        db,
+        envelopeSecret: envelopeSecret(),
+        grantSecret: grantSecret(),
+        ...(env.EXECUTION_ENVELOPE_TTL_SECONDS ? { envelopeTtlSeconds: Number(env.EXECUTION_ENVELOPE_TTL_SECONDS) } : {}),
+      }, grant, request.body);
+    } catch (error) {
+      if (error instanceof EnvelopeBrokerError) return reply.code(error.httpStatus).send({ error: error.code });
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "broker.request_invalid" });
+    }
+  });
+
   app.get("/v1/runs", async (request) => {
     await requirePrincipal(request, "run.read", { kind: "run" });
     return { runs: await listRuns(db) };
