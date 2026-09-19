@@ -40,16 +40,12 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # Compiles the KYC and invoice domains to content-addressed plans, then
-      # runs the Rust workspace tests and the TypeScript check/test/build set.
+      # make compile builds the compiler of record with --release and compiles
+      # both domains with it. apps/control-api resolves that same binary at
+      # target/release/harnessc and fails closed when it is absent, so this has
+      # to run before pnpm check.
       - name: compile domain packages
         run: make compile
-
-      # apps/control-api resolves the compiler of record at target/release/harnessc
-      # and fails closed when it is absent, so the release binary has to exist
-      # before pnpm check runs. `make compile` only produces a debug build.
-      - name: build the compiler of record
-        run: cargo build --release -p harness-compiler
 
       - name: cargo test
         run: cargo test --workspace
@@ -94,6 +90,13 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The templates configure what the services read, and the services fail
+      # closed on a missing variable. Without this, a service gaining a variable
+      # locally leaves the Azure stamp deploying a configuration that starts and
+      # then misbehaves -- found after deployment instead of here.
+      - name: deployment parity
+        run: ./scripts/check-deployment-parity.sh
+
   scripts:
     name: shell script syntax
     runs-on: ubuntu-latest
@@ -105,4 +108,4 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           # Errors only: these scripts run unattended in delivery, so a genuine
           # defect fails the build while style preferences do not.
-          shellcheck --severity=error scripts/azure/*.sh
+          shellcheck --severity=error scripts/azure/*.sh scripts/check-deployment-parity.sh

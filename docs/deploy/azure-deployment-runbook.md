@@ -3,10 +3,10 @@
 **Status:** executable runbook for the repository as it stands today
 **Scope:** showcase deployment, synthetic data only, one resource group, one region
 **Target topology:** Azure Container Apps + Azure Database for PostgreSQL Flexible Server + Azure Container Registry + Key Vault + Log Analytics/Application Insights, with Microsoft Entra ID sign-in in front of the control surface
-**Verified against:** `main` at `1418c25` ("Complete P0/P1 production hardening"). Every environment variable
-below was diffed against that revision's `compose.yaml`, service by service. The
-stack is under active hardening, so re-run that comparison after merging a newer
-`main` — `infra/README.md` says how.
+**Kept honest by:** `scripts/check-deployment-parity.sh`, which fails `make check`
+and the `validate` workflow when the environment blocks below stop matching what
+the services actually read. The stack is under active hardening, so that
+comparison is automated rather than left to anyone remembering to repeat it.
 **Companion documents:** [Azure POC migration plan](../plans/azure-poc-migration-plan.md) (target architecture), [runtime isolation and Azure migration](../plans/runtime-isolation-azure-migration.md) (Foundry runtime path)
 
 ---
