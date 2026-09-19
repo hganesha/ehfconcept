@@ -24,6 +24,7 @@ const app = buildRuntimeHost({
     gatewayUrl: process.env.CAPABILITY_GATEWAY_URL ?? "http://capability-gateway:4101",
     caseApiUrl: process.env.CASE_API_URL ?? "http://case-api:4102",
     executionSecret: requiredEnv("EXECUTION_ENVELOPE_SECRET", "execution_auth.secret_missing"),
+    serviceToken: requiredEnv("RUNTIME_SERVICE_TOKEN", "runtime.service_token_missing"),
     providerMetadata: {
       host: "local_http",
       contractVersion: "runtime.invocation.v1",

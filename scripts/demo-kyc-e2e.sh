@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+
 control_api="${CONTROL_API_URL:-http://localhost:4100}"
 gateway_api="${GATEWAY_URL:-http://localhost:4101}"
 case_api="${CASE_API_URL:-http://localhost:4102}"
@@ -18,11 +20,11 @@ analyst_actor='{"type":"HUMAN","principalId":"poc-analyst","roles":["KYC.Analyst
 senior_actor='{"type":"HUMAN","principalId":"poc-senior-reviewer","roles":["KYC.SeniorReviewer"]}'
 
 plan_file="artifacts/plans/kyc.plan.json"
-admitted="$(curl -fsS -X POST "${control_api}/v1/plans" -H 'content-type: application/json' --data-binary "@${plan_file}")"
+admitted="$(curl -fsS "${edge_auth[@]}" -X POST "${control_api}/v1/plans" -H 'content-type: application/json' --data-binary "@${plan_file}")"
 plan_digest="$(jq -r '.plan.planDigest' <<<"${admitted}")"
 
 run_input="$(jq -n --arg name "${customer_name}" --arg country "${customer_country}" '{name:$name,country:$country}')"
-run_created="$(curl -fsS -X POST "${control_api}/v1/runs" \
+run_created="$(curl -fsS "${edge_auth[@]}" -X POST "${control_api}/v1/runs" \
   -H 'content-type: application/json' \
   -H "idempotency-key: kyc-e2e:${demo_id}" \
   --data-binary "$(jq -n --arg planDigest "${plan_digest}" --argjson input "${run_input}" '{planDigest:$planDigest,input:$input}')")"
@@ -30,7 +32,7 @@ run_id="$(jq -r '.run.runId' <<<"${run_created}")"
 
 run_record=''
 for _ in $(seq 1 90); do
-  run_record="$(curl -fsS "${control_api}/v1/runs/${run_id}")"
+  run_record="$(curl -fsS "${edge_auth[@]}" "${control_api}/v1/runs/${run_id}")"
   run_status="$(jq -r '.status' <<<"${run_record}")"
   if [[ "${run_status}" =~ ^(completed|manual_review|denied|failed)$ ]]; then break; fi
   sleep 1
@@ -41,10 +43,10 @@ if [[ "$(jq -r '.status' <<<"${run_record}")" != "completed" ]]; then
   exit 1
 fi
 
-runtime_mode="$(curl -fsS "${gateway_api}/v1/status" | jq -r '.runtimeMode')"
+runtime_mode="$(curl -fsS "${edge_auth[@]}" "${gateway_api}/v1/status" | jq -r '.runtimeMode')"
 trace_id="$(jq -r '.traceId // ""' <<<"${run_record}")"
 model_output="$(jq -c '.output' <<<"${run_record}")"
-receipts="$(curl -fsS "${control_api}/v1/gateway/receipts?runId=${run_id}&limit=20")"
+receipts="$(curl -fsS "${edge_auth[@]}" "${control_api}/v1/gateway/receipts?runId=${run_id}&limit=20")"
 screening_output="$(jq -c '[.receipts[] | select(.capabilityId == "screening.sanctions.search")][0].result.output' <<<"${receipts}")"
 sanctions_match="$(jq -r '.match // false' <<<"${screening_output}")"
 
@@ -55,7 +57,7 @@ create_body="$(jq -n \
   --arg harnessPlanDigest "${plan_digest}" \
   --argjson actor "${system_actor}" \
   '{tenantId:$tenantId,externalRef:$externalRef,policySnapshotDigest:$policySnapshotDigest,harnessPlanDigest:$harnessPlanDigest,actor:$actor}')"
-case_created="$(curl -fsS -X POST "${case_api}/v1/cases" \
+case_created="$(curl -fsS "${edge_auth[@]}" -X POST "${case_api}/v1/cases" \
   -H 'content-type: application/json' \
   -H "idempotency-key: kyc-e2e:${demo_id}:case" \
   --data-binary "${create_body}")"
@@ -67,7 +69,7 @@ command() {
   local command_suffix="$3"
   local payload="$4"
   local sequence body
-  sequence="$(curl -fsS "${case_api}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}" | jq -r '.case.caseSequence')"
+  sequence="$(curl -fsS "${edge_auth[@]}" "${case_api}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}" | jq -r '.case.caseSequence')"
   body="$(jq -n \
     --arg commandId "cmd_${demo_id}_${command_suffix}" \
     --arg commandType "${command_type}" \
@@ -82,7 +84,7 @@ command() {
     --argjson payload "${payload}" \
     --argjson caseSequence "${sequence}" \
     '{commandId:$commandId,commandType:$commandType,commandVersion:$commandVersion,tenantId:$tenantId,caseId:$caseId,actor:$actor,authority:{planDigest:$planDigest,permissionEnvelopeDigest:$permissionEnvelopeDigest,policySnapshotDigest:$policySnapshotDigest},payload:$payload,preconditions:{caseSequence:$caseSequence},idempotencyKey:$idempotencyKey}')"
-  curl -fsS -X POST "${case_api}/v1/cases/${case_id}/commands" -H 'content-type: application/json' --data-binary "${body}"
+  curl -fsS "${edge_auth[@]}" -X POST "${case_api}/v1/cases/${case_id}/commands" -H 'content-type: application/json' --data-binary "${body}"
 }
 
 register_evidence() {
@@ -104,7 +106,7 @@ register_evidence() {
     --argjson trust "${trust_json}" \
     --argjson createdBy "${system_actor}" \
     '{tenantId:$tenantId,caseId:$caseId,type:$type,mediaType:"application/json",contentBase64:$contentBase64,source:$source,subjectRefs:[$subjectRef],trust:$trust,createdBy:$createdBy}')"
-  curl -fsS -X POST "${case_api}/v1/evidence:register" \
+  curl -fsS "${edge_auth[@]}" -X POST "${case_api}/v1/evidence:register" \
     -H 'content-type: application/json' \
     -H "idempotency-key: ${tenant_id}:${case_id}:${demo_id}:${evidence_suffix}" \
     --data-binary "${body}"
@@ -167,8 +169,8 @@ gate="$(command "${system_actor}" RecordGateResult final_gate "$(jq -n --arg rec
 gate_id="$(jq -r '.createdIdentifiers.gateResultId' <<<"${gate}")"
 command "${senior_actor}" FinalizeDisposition finalize "$(jq -n --arg recommendationRef "${recommendation_id}" --arg gateResultRef "${gate_id}" --arg reviewRef "${review_id}" --arg evidenceId "${screening_evidence_id}" '{outcome:"APPROVED",recommendationRef:$recommendationRef,gateResultRef:$gateResultRef,reviewRef:$reviewRef,rationale:"Authorized low-risk POC disposition after independent QA and human review.",evidenceRefs:[$evidenceId],followUpObligations:["periodic_review_policy_unset_for_poc"]}')" >/dev/null
 
-case_view="$(curl -fsS "${case_api}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}")"
-ledger="$(curl -fsS -X POST "${case_api}/v1/cases/${case_id}/ledger:verify" -H "x-tenant-id: ${tenant_id}")"
+case_view="$(curl -fsS "${edge_auth[@]}" "${case_api}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}")"
+ledger="$(curl -fsS "${edge_auth[@]}" -X POST "${case_api}/v1/cases/${case_id}/ledger:verify" -H "x-tenant-id: ${tenant_id}")"
 jq -n \
   --arg caseId "${case_id}" \
   --arg runId "${run_id}" \

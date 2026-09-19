@@ -39,6 +39,13 @@ services:
       CASE_ARTIFACT_BACKEND: ${CASE_ARTIFACT_BACKEND:-postgres}
       CASE_EVIDENCE_REQUIRE_SCAN: ${CASE_EVIDENCE_REQUIRE_SCAN:-false}
       CASE_EVIDENCE_MAX_BYTES: ${CASE_EVIDENCE_MAX_BYTES:-1048576}
+      PLATFORM_MODE: ${PLATFORM_MODE:-local}
+      IDENTITY_PROVIDER: ${IDENTITY_PROVIDER:-local_headers}
+      LOCAL_DEFAULT_TENANT_ID: ${CASE_UI_TENANT_ID:-tenant_demo}
+      # Workload credentials for the local stack. Azure mode refuses to start when these
+      # are present; managed-identity Entra tokens replace them.
+      EDGE_SERVICE_TOKEN: ${EDGE_SERVICE_TOKEN:-local-edge-service-token-change-before-sharing}
+      RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}
     depends_on:
       postgres:
         condition: service_healthy
@@ -109,6 +116,8 @@ services:
       RUNTIME_CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
       RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
       EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
+      RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}
+      PLATFORM_MODE: ${PLATFORM_MODE:-local}
       CAPABILITY_GATEWAY_URL: http://capability-gateway:4101
       CASE_API_URL: http://case-api:4102
       RUNTIME_HOST_PORT: "8088"
@@ -165,6 +174,11 @@ services:
       CAPABILITY_GATEWAY_INTERNAL_URL: http://capability-gateway:4101
       CASE_API_INTERNAL_URL: http://case-api:4102
       CASE_UI_TENANT_ID: ${CASE_UI_TENANT_ID:-tenant_demo}
+      EDGE_SERVICE_TOKEN: ${EDGE_SERVICE_TOKEN:-local-edge-service-token-change-before-sharing}
+      CONTROL_UI_ACTOR_ID: ${CONTROL_UI_ACTOR_ID:-local-author}
+      CONTROL_UI_ACTOR_ROLES: ${CONTROL_UI_ACTOR_ROLES:-Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer}
+      CONTROL_UI_APPROVER_ID: ${CONTROL_UI_APPROVER_ID:-local-approver}
+      CONTROL_UI_APPROVER_ROLES: ${CONTROL_UI_APPROVER_ROLES:-Harness.Reader,Harness.Approver}
       JAEGER_API_INTERNAL_URL: http://jaeger:16686
       TRACE_VIEWER_PUBLIC_URL: http://localhost:16686
       CONTROL_UI_VERSION: 0.1.0

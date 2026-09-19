@@ -32,6 +32,12 @@ export type RuntimeContext = {
   gatewayUrl: string;
   caseApiUrl?: string;
   executionSecret: string;
+  /**
+   * Credential proving which workload is calling the internal services. It answers a
+   * different question than the execution envelope, which says what this run, node and
+   * attempt may do; both are required at the gateway.
+   */
+  serviceToken: string;
 };
 
 type CaseWriteScope = {
@@ -197,7 +203,8 @@ export async function invokeCapability(
     },
   }, async (span) => {
     const headers: Record<string, string> = {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${context.serviceToken}`,
+      "x-execution-envelope": token,
       "content-type": "application/json",
     };
     injectTraceContext(headers);
@@ -237,7 +244,11 @@ async function caseRequest(
       "harness.plan.digest_prefix": context.plan.planDigest.slice(0, 12),
     },
   }, async (span) => {
-    const headers: Record<string, string> = { "content-type": "application/json", ...(init.headers as Record<string, string> ?? {}) };
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${context.serviceToken}`,
+      "content-type": "application/json",
+      ...(init.headers as Record<string, string> ?? {}),
+    };
     injectTraceContext(headers);
     const response = await fetch(`${context.caseApiUrl}${path}`, { ...init, headers, signal: AbortSignal.timeout(10_000) });
     span.setAttribute("http.response.status_code", response.status);

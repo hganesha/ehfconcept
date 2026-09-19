@@ -32,6 +32,9 @@ importers:
       '@ehf/execution-auth':
         specifier: workspace:*
         version: link:../../packages/execution-auth
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
@@ -53,6 +56,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/telemetry':
         specifier: workspace:*
         version: link:../../packages/telemetry
@@ -68,6 +74,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/identity':
+        specifier: workspace:*
+        version: link:../../packages/identity
       '@ehf/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
@@ -196,6 +205,12 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../contracts
+      jose:
+        specifier: 6.2.12
+        version: 6.2.12
+
+  packages/identity:
+    dependencies:
       jose:
         specifier: 6.2.12
         version: 6.2.12

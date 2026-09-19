@@ -13,6 +13,7 @@ export type RuntimeExecutorDependencies = {
   gatewayUrl: string;
   caseApiUrl?: string;
   executionSecret: string;
+  serviceToken: string;
   providerMetadata?: Record<string, string>;
 };
 
@@ -34,6 +35,7 @@ export async function executeRuntimeInvocation(
     gatewayUrl: dependencies.gatewayUrl,
     ...(dependencies.caseApiUrl ? { caseApiUrl: dependencies.caseApiUrl } : {}),
     executionSecret: dependencies.executionSecret,
+    serviceToken: dependencies.serviceToken,
   }, dependencies.saver);
   try {
     const output = await compiled.invoke({ input: request.input, values: {} }, {
