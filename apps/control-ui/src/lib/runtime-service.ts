@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { DefaultAzureCredential } from "@azure/identity";
+import { isAzureMode } from "@ehf/identity";
+import { headers } from "next/headers";
 import type {
   CompiledHarnessPlan,
   CaseActivityView,
@@ -34,42 +37,44 @@ const controlBase = (process.env.CONTROL_API_INTERNAL_URL ?? "http://127.0.0.1:4
 const gatewayBase = (process.env.CAPABILITY_GATEWAY_INTERNAL_URL ?? "http://127.0.0.1:4101").replace(/\/$/, "");
 const jaegerBase = (process.env.JAEGER_API_INTERNAL_URL ?? "http://127.0.0.1:16686").replace(/\/$/, "");
 const caseBase = (process.env.CASE_API_INTERNAL_URL ?? "http://127.0.0.1:4102").replace(/\/$/, "");
-const caseTenantId = process.env.CASE_UI_TENANT_ID ?? "tenant_demo";
+const edgeCredential = new DefaultAzureCredential({
+  ...(process.env.AZURE_CLIENT_ID ? { managedIdentityClientId: process.env.AZURE_CLIENT_ID } : {}),
+});
+let cachedEdgeToken: { token: string; expiresOnTimestamp: number } | null = null;
 
-/**
- * Credential the control surface presents to the internal services.
- *
- * This module is the backend-for-frontend: it is the only component that has seen the
- * user, so it proves it is the edge and carries the acting persona onwards. The services
- * believe the persona only because the edge credential came with it -- the actor and
- * tenant headers used to be accepted from anyone.
- */
-const edgeServiceToken = process.env.EDGE_SERVICE_TOKEN ?? "";
+async function edgeAuthorization(): Promise<string> {
+  if (!isAzureMode()) {
+    const token = process.env.EDGE_SERVICE_TOKEN;
+    if (!token) throw new Error("control_ui.edge_service_token_missing");
+    return `Bearer ${token}`;
+  }
+  if (cachedEdgeToken && cachedEdgeToken.expiresOnTimestamp > Date.now() + 60_000) return `Bearer ${cachedEdgeToken.token}`;
+  const scope = process.env.EDGE_TOKEN_SCOPE;
+  if (!scope) throw new Error("control_ui.edge_token_scope_missing");
+  const token = await edgeCredential.getToken(scope);
+  if (!token) throw new Error("control_ui.edge_token_unavailable");
+  cachedEdgeToken = token;
+  return `Bearer ${token.token}`;
+}
 
-export type EdgePersona = "operator" | "approver";
-
-const personas: Record<EdgePersona, { actorId: string; roles: string }> = {
-  operator: {
-    actorId: process.env.CONTROL_UI_ACTOR_ID ?? "local-author",
-    roles: process.env.CONTROL_UI_ACTOR_ROLES
-      ?? "Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer",
-  },
-  // Approval and publication run as a separate persona so the local demo exercises the
-  // same separation of duties the deployed roles describe, instead of one identity
-  // authoring and approving its own plan.
-  approver: {
-    actorId: process.env.CONTROL_UI_APPROVER_ID ?? "local-approver",
-    roles: process.env.CONTROL_UI_APPROVER_ROLES ?? "Harness.Reader,Harness.Approver",
-  },
-};
-
-function edgeHeaders(persona: EdgePersona = "operator"): Record<string, string> {
-  const identity = personas[persona];
+async function edgeHeaders(): Promise<Record<string, string>> {
+  const incoming = await headers();
+  const subjectId = incoming.get("x-ehf-authenticated-subject");
+  const tenantId = incoming.get("x-ehf-authenticated-tenant");
+  const roles = incoming.get("x-ehf-authenticated-roles");
+  if (!subjectId || !tenantId || !roles) throw new Error("control_ui.authenticated_context_missing");
   return {
-    ...(edgeServiceToken ? { authorization: `Bearer ${edgeServiceToken}` } : {}),
-    "x-actor-id": identity.actorId,
-    "x-actor-roles": identity.roles,
+    authorization: await edgeAuthorization(),
+    "x-actor-id": subjectId,
+    "x-actor-roles": roles,
+    "x-tenant-id": tenantId,
   };
+}
+
+async function authenticatedTenantId(): Promise<string> {
+  const tenantId = (await headers()).get("x-ehf-authenticated-tenant");
+  if (!tenantId) throw new Error("control_ui.authenticated_context_missing");
+  return tenantId;
 }
 
 type JsonMap = Record<string, unknown>;
@@ -182,10 +187,11 @@ const KNOWN_EVENT_CODES = new Set([
 ]);
 
 async function apiJson<T>(base: string, path: string, init?: RequestInit): Promise<T> {
+  const identityHeaders = await edgeHeaders();
   const response = await fetch(`${base}${path}`, {
     cache: "no-store",
     ...init,
-    headers: { ...edgeHeaders(), ...(init?.headers as Record<string, string> | undefined) },
+    headers: { ...(init?.headers as Record<string, string> | undefined), ...identityHeaders },
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -201,12 +207,6 @@ async function optionalJson<T>(base: string, path: string): Promise<T | null> {
   } catch {
     return null;
   }
-}
-
-function caseHeaders(): HeadersInit {
-  // The tenant is a requested scope; the case service checks it against the assignment
-  // the edge credential already carries and rejects anything wider.
-  return { "x-tenant-id": caseTenantId };
 }
 
 function sha(value: unknown): string {
@@ -441,7 +441,7 @@ export async function admitCompiledPlan(rawText: string): Promise<{
   const digest = (parsed as { planDigest?: unknown }).planDigest;
   const response = await fetch(`${controlBase}/v1/plans`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...edgeHeaders() },
+    headers: { "content-type": "application/json", ...await edgeHeaders() },
     body: JSON.stringify(parsed),
     cache: "no-store",
   });
@@ -632,7 +632,7 @@ export async function startNewRun(params: { planDigest: string; inputPayload: Js
 }> {
   const response = await fetch(`${controlBase}/v1/runs`, {
     method: "POST",
-    headers: { "content-type": "application/json", "idempotency-key": params.idempotencyKey, ...edgeHeaders() },
+    headers: { "content-type": "application/json", "idempotency-key": params.idempotencyKey, ...await edgeHeaders() },
     body: JSON.stringify({ planDigest: params.planDigest, input: params.inputPayload }),
     cache: "no-store",
   });
@@ -728,7 +728,7 @@ export async function getOverviewData(): Promise<OverviewView> {
     Promise.all([
       serviceStatus("api", "Control-Plane API", `${controlBase}/health/ready`, "Plan admission and execution read models"),
       serviceStatus("gateway", "Capability Gateway", `${gatewayBase}/health/ready`, "Credential envelope and capability policy"),
-      serviceStatus("cases", "Case Store API", `${caseBase}/health/ready`, `Canonical case, ledger, and evidence views for ${caseTenantId}`),
+      serviceStatus("cases", "Case Store API", `${caseBase}/health/ready`, "Canonical tenant-scoped case, ledger, and evidence views"),
       serviceStatus("jaeger", "OpenTelemetry / Jaeger", `${jaegerBase}/api/services`, "Cross-service trace store and viewer"),
     ]),
   ]);
@@ -931,7 +931,7 @@ export async function listCaseSummaries(filters?: { status?: string; query?: str
   const query = filters?.status && filters.status !== "all"
     ? `?status=${encodeURIComponent(filters.status)}`
     : "";
-  const response = await apiJson<{ cases: RawCaseSummary[] }>(caseBase, `/v1/cases${query}`, { headers: caseHeaders() });
+  const response = await apiJson<{ cases: RawCaseSummary[] }>(caseBase, `/v1/cases${query}`);
   const needle = filters?.query?.trim().toLowerCase();
   return response.cases.map(mapCaseSummary).filter((item) => !needle || [
     item.caseId,
@@ -950,7 +950,7 @@ export async function createDemoKycCase(input: {
   riskTier?: string;
   policySnapshotDigest?: string;
 }): Promise<{ caseId: string; subjectId: string; inputPatch: JsonMap }> {
-  const tenantId = input.tenantId?.trim() || caseTenantId;
+  const tenantId = await authenticatedTenantId();
   const name = input.name?.trim() || "Ada Lovelace";
   const country = input.country?.trim().toUpperCase() || "US";
   if (country !== "US") throw new Error("demo_case.us_jurisdiction_only");
@@ -1167,12 +1167,12 @@ export async function getCaseDetail(caseId: string): Promise<CaseDetailView | nu
   const encoded = encodeURIComponent(decodeURIComponent(caseId));
   let view: RawCaseView;
   try {
-    view = await apiJson<RawCaseView>(caseBase, `/v1/cases/${encoded}`, { headers: caseHeaders() });
+    view = await apiJson<RawCaseView>(caseBase, `/v1/cases/${encoded}`);
   } catch (error) {
     if (error instanceof Error && error.message.includes("case.not_found")) return null;
     throw error;
   }
-  const eventResponse = await apiJson<{ events: RawCaseEvent[] }>(caseBase, `/v1/cases/${encoded}/events`, { headers: caseHeaders() });
+  const eventResponse = await apiJson<{ events: RawCaseEvent[] }>(caseBase, `/v1/cases/${encoded}/events`);
   const activities: CaseActivityView[] = eventResponse.events.map((event) => ({
     eventId: event.eventId,
     sequence: event.caseSequence,
@@ -1248,11 +1248,8 @@ export async function updateAuthoringDraftView(draftId: string, input: { expecte
 }
 
 export async function advanceAuthoringDraft(draftId: string, action: "compile" | "evaluate" | "approve" | "publish"): Promise<AuthoringDraftView> {
-  // Approval and publication are the approver's actions; compile and evaluate are the
-  // author's. Sending both as one identity is what made self-approval invisible.
-  const persona: EdgePersona = action === "approve" || action === "publish" ? "approver" : "operator";
   const draft = await apiJson<RawAuthoringDraft>(controlBase, `/v1/authoring/drafts/${encodeURIComponent(decodeURIComponent(draftId))}/${action}`, {
-    method: "POST", headers: edgeHeaders(persona),
+    method: "POST",
   });
   return mapAuthoringDraft(draft);
 }

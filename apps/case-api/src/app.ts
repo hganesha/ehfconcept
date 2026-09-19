@@ -23,6 +23,7 @@ import {
   createGuard,
   createWorkloadResolverFromEnv,
   DelegatedPrincipalResolver,
+  isAzureMode,
   type AuthorizationDecision,
   type PlatformAction,
   type Principal,
@@ -87,7 +88,9 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
   const env = options.env ?? process.env;
   const store = options.store ?? createCaseStore();
   const workloadResolver = createWorkloadResolverFromEnv(options.serviceGrants ?? serviceGrantsFromEnv(env), env);
-  const executionSecret = options.executionSecret ?? env.EXECUTION_ENVELOPE_SECRET ?? "";
+  const executionSecret = options.executionSecret ?? (isAzureMode(env)
+    ? env.EXECUTION_ENVELOPE_PUBLIC_KEY_PEM
+    : env.EXECUTION_ENVELOPE_SECRET) ?? "";
   const recordDecision = (decision: AuthorizationDecision) => app.log.info({ authorization: decision }, "authorization decision");
   const humanGuard = createGuard({ resolver: new DelegatedPrincipalResolver(workloadResolver), onDecision: recordDecision });
   const workloadGuard = createGuard({ resolver: workloadResolver, onDecision: recordDecision });

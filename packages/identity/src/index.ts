@@ -37,3 +37,4 @@ export {
   type ServiceTokenGrant,
 } from "./workload.js";
 export { createGuard, type Guard, type GuardOptions } from "./fastify.js";
+export { createAzureAccessTokenProvider, createPostgresAccessTokenProvider } from "./postgres.js";

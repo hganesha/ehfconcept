@@ -10,7 +10,7 @@ function store(rows: Record<string, unknown[]>): { store: CaseStore; statements:
   const client = {
     query: async (text: string, values: unknown[] = []) => {
       statements.push({ text, values });
-      if (!text.includes("select outbox_id")) return { rowCount: 0, rows: [] };
+      if (!text.includes("returning outbox.outbox_id")) return { rowCount: 0, rows: [] };
       const table = text.includes('"case_ledger"') ? "case" : "evidence";
       return { rowCount: (rows[table] ?? []).length, rows: rows[table] ?? [] };
     },
@@ -47,7 +47,7 @@ describe("outbox relay", () => {
     // Rows are claimed with skip locked so parallel relays cannot publish the same
     // event, and marked only after the sink accepted them.
     expect(statements.some((s) => s.text.includes("for update skip locked"))).toBe(true);
-    const claimIndex = statements.findIndex((s) => s.text.includes("select outbox_id"));
+    const claimIndex = statements.findIndex((s) => s.text.includes("returning outbox.outbox_id"));
     const markIndex = statements.findIndex((s) => s.text.includes("set published_at = now()"));
     expect(markIndex).toBeGreaterThan(claimIndex);
   });
@@ -68,7 +68,7 @@ describe("outbox relay", () => {
     const { store: subject, statements } = store({ case: [row("ob_3")] });
     await expect(drainOutbox(subject, sink)).rejects.toThrow("bus unavailable");
     expect(statements.some((s) => s.text.includes("set published_at = now()"))).toBe(false);
-    expect(statements.some((s) => s.text.trim() === "rollback")).toBe(true);
+    expect(statements.some((s) => s.text.includes("set publish_claim_id = null"))).toBe(true);
   });
 
   it("purges published rows only when a retention window is set", async () => {

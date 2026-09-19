@@ -19,8 +19,12 @@ type InFlight = {
   controller: AbortController;
 };
 
-export function buildRuntimeHost(input: { authToken: string; execute: RuntimeHostExecutor }) {
-  if (!input.authToken) throw new Error("runtime_host.auth_token_missing");
+export function buildRuntimeHost(input: {
+  authToken?: string;
+  authorize?: (authorization: string | undefined) => Promise<boolean>;
+  execute: RuntimeHostExecutor;
+}) {
+  if (!input.authToken && !input.authorize) throw new Error("runtime_host.authorization_missing");
   const app = Fastify({ logger: true, bodyLimit: 2 * 1024 * 1024 });
 
   /**
@@ -31,13 +35,15 @@ export function buildRuntimeHost(input: { authToken: string; execute: RuntimeHos
   const inFlight = new Map<string, InFlight>();
   const forget = (invocationId: string) => setTimeout(() => inFlight.delete(invocationId), 5 * 60_000).unref();
 
-  const authorized = (request: { headers: { authorization?: string | undefined } }): boolean =>
-    tokenMatches(request.headers.authorization, input.authToken);
+  const authorized = async (request: { headers: { authorization?: string | undefined } }): Promise<boolean> => {
+    if (input.authorize) return input.authorize(request.headers.authorization);
+    return tokenMatches(request.headers.authorization, input.authToken ?? "");
+  };
 
   app.get("/health/live", async () => ({ status: "ok" }));
   app.get("/health/ready", async () => ({ status: "ready", contractVersion: "runtime.invocation.v1" }));
   app.get<{ Params: { invocationId: string } }>("/invocations/:invocationId", async (request, reply) => {
-    if (!authorized(request)) return reply.code(401).send({ error: "runtime_host.unauthorized" });
+    if (!await authorized(request)) return reply.code(401).send({ error: "runtime_host.unauthorized" });
     const entry = inFlight.get(request.params.invocationId);
     // An invocation this host has no record of is genuinely unknown, not failed: saying
     // "failed" would licence a retry that could duplicate an effect already committed.
@@ -51,7 +57,7 @@ export function buildRuntimeHost(input: { authToken: string; execute: RuntimeHos
   });
 
   app.post<{ Params: { invocationId: string } }>("/invocations/:invocationId/cancel", async (request, reply) => {
-    if (!authorized(request)) return reply.code(401).send({ error: "runtime_host.unauthorized" });
+    if (!await authorized(request)) return reply.code(401).send({ error: "runtime_host.unauthorized" });
     const entry = inFlight.get(request.params.invocationId);
     if (!entry) return reply.code(404).send({ error: "runtime_host.invocation_unknown" });
     // Requested, not effective: the runtime stops at its next cancellation point, and
@@ -61,10 +67,14 @@ export function buildRuntimeHost(input: { authToken: string; execute: RuntimeHos
   });
 
   app.post("/invocations", async (request, reply) => {
-    if (!authorized(request)) {
+    if (!await authorized(request)) {
       return reply.code(401).send({ error: "runtime_host.unauthorized" });
     }
-    const parsed = runtimeInvocationSchema.safeParse(request.body);
+    const wrapped = Boolean(request.body && typeof request.body === "object" && "message" in request.body);
+    const candidate = wrapped
+      ? (request.body as { message: unknown }).message
+      : request.body;
+    const parsed = runtimeInvocationSchema.safeParse(candidate);
     if (!parsed.success) {
       return reply.code(400).send({ error: "runtime_host.invalid_invocation" });
     }
@@ -93,7 +103,7 @@ export function buildRuntimeHost(input: { authToken: string; execute: RuntimeHos
         forget(parsed.data.invocationId);
       }
     }, parent);
-    return reply.send(result);
+    return reply.send(wrapped ? { result } : result);
   });
 
   return app;

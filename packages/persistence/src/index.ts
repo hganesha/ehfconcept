@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
+import { createPostgresAccessTokenProvider, isAzureMode } from "@ehf/identity";
 import {
   agentRegistrationSchema,
   capabilityRegistrationSchema,
@@ -24,7 +25,15 @@ export type Database = InstanceType<typeof Pool>;
 
 export function createDatabase(connectionString = process.env.DATABASE_URL): Database {
   if (!connectionString) throw new Error("database.url_missing");
-  return new Pool({ connectionString, max: 12 });
+  const max = Number(process.env.DB_POOL_MAX ?? 12);
+  if (!Number.isInteger(max) || max < 1 || max > 100) throw new Error("database.pool_max_invalid");
+  return new Pool({
+    connectionString,
+    ...(isAzureMode() ? { password: createPostgresAccessTokenProvider() } : {}),
+    max,
+    connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 5_000),
+    idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30_000),
+  });
 }
 
 type RunRow = {
@@ -96,7 +105,7 @@ export async function admitPlan(db: Database, input: unknown, tenantId: string):
   const result = await db.query(`
     insert into harness_control.plans(plan_digest, plan_id, name, domain, version, plan, tenant_id)
     values ($1, $2, $3, $4, $5, $6::jsonb, $7)
-    on conflict (plan_digest) do nothing
+    on conflict (tenant_id, plan_digest) do nothing
   `, [plan.planDigest, plan.planId, plan.metadata.name, plan.metadata.domain, plan.metadata.version, JSON.stringify(plan), tenantId]);
   return { created: (result.rowCount ?? 0) > 0, plan };
 }
@@ -144,14 +153,17 @@ export async function createRun(
   input: { planDigest: string; runInput: unknown; idempotencyKey: string; tenantId: string },
 ): Promise<{ created: boolean; run: RunRecord }> {
   const runId = `RUN-${randomUUID()}`;
+  const requestDigest = stableDigest({ planDigest: input.planDigest, input: input.runInput });
   const result = await db.query<RunRow>(`
-    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input, tenant_id)
-    values ($1, $2, $3, 'queued', $4::jsonb, $5)
-    on conflict (idempotency_key) do update set updated_at = harness_runtime.runs.updated_at
+    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input, tenant_id, request_digest)
+    values ($1, $2, $3, 'queued', $4::jsonb, $5, $6)
+    on conflict (tenant_id, idempotency_key) do update
+      set updated_at = harness_runtime.runs.updated_at
+      where harness_runtime.runs.request_digest = excluded.request_digest
     returning ${runColumns}
-  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput), input.tenantId]);
+  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput), input.tenantId, requestDigest]);
   const row = result.rows[0];
-  if (!row) throw new Error("run.create_failed");
+  if (!row) throw new Error("run.idempotency_conflict");
   return { created: row.run_id === runId, run: mapRun(row) };
 }
 
@@ -532,7 +544,7 @@ export async function appendEvent(
   }
 }
 
-export async function listEvents(db: Database, runId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
+export async function listEvents(db: Database, runId: string, tenantId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
   const result = await db.query<{
     sequence: string | number;
     code: string;
@@ -541,12 +553,13 @@ export async function listEvents(db: Database, runId: string, afterSequence = 0)
     values: Record<string, unknown>;
     occurred_at: Date;
   }>(`
-    select sequence, code, node_id, status, values, occurred_at
-    from harness_runtime.run_events
-    where run_id = $1 and sequence > $2
+    select event.sequence, event.code, event.node_id, event.status, event.values, event.occurred_at
+    from harness_runtime.run_events event
+    inner join harness_runtime.runs run on run.run_id = event.run_id
+    where event.run_id = $1 and run.tenant_id = $2 and sequence > $3
     order by sequence
     limit 1000
-  `, [runId, afterSequence]);
+  `, [runId, tenantId, afterSequence]);
   return result.rows.map((row) => ({
     runId,
     sequence: Number(row.sequence),
@@ -655,35 +668,72 @@ export type GatewayReceiptInput = {
 
 export async function reserveGatewayReceipt(
   db: Database,
-  input: GatewayReceiptInput,
+  input: GatewayReceiptInput & {
+    budget: { modelCall: boolean; maxCapabilityCalls: number; maxModelCalls: number; maxCostUsd: number };
+  },
 ): Promise<{ created: boolean; result: CapabilityResult | null }> {
-  const result = await db.query<{ result: CapabilityResult | null }>(`
-    insert into harness_gateway.receipts(
-      invocation_id, run_id, node_id, attempt, fencing_epoch, plan_digest,
-      permission_digest, capability_id, effect, decision, reason_code, request_digest, trace_id, span_id
-    ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    on conflict (invocation_id) do nothing
-    returning result
-  `, [
-    input.invocationId, input.runId, input.nodeId, input.attempt, input.fencingEpoch,
-    input.planDigest, input.permissionDigest, input.capabilityId, input.effect,
-    input.decision, input.reasonCode, input.requestDigest, input.traceId ?? null, input.spanId ?? null,
-  ]);
-  if ((result.rowCount ?? 0) > 0) return { created: true, result: null };
-  const existing = await db.query<{ result: CapabilityResult | null; request_digest: string }>(
-    "select result, request_digest from harness_gateway.receipts where invocation_id = $1",
-    [input.invocationId],
-  );
-  if (existing.rows[0]?.request_digest !== input.requestDigest) throw new Error("gateway.idempotency_conflict");
-  return { created: false, result: existing.rows[0]?.result ?? null };
+  const client = await db.connect();
+  try {
+    await client.query("begin");
+    const receipt = await client.query<{ result: CapabilityResult | null }>(`
+      insert into harness_gateway.receipts(
+        invocation_id, run_id, tenant_id, node_id, attempt, fencing_epoch, plan_digest,
+        permission_digest, capability_id, effect, decision, reason_code, request_digest, trace_id, span_id
+      )
+      select $1, $2, run.tenant_id, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+      from harness_runtime.runs run
+      where run.run_id = $2
+      on conflict (invocation_id) do nothing
+      returning result
+    `, [
+      input.invocationId, input.runId, input.nodeId, input.attempt, input.fencingEpoch,
+      input.planDigest, input.permissionDigest, input.capabilityId, input.effect,
+      input.decision, input.reasonCode, input.requestDigest, input.traceId ?? null, input.spanId ?? null,
+    ]);
+    if ((receipt.rowCount ?? 0) === 0) {
+      const existing = await client.query<{ result: CapabilityResult | null; request_digest: string }>(`
+        select result, request_digest from harness_gateway.receipts
+        where invocation_id = $1 and run_id = $2
+      `, [input.invocationId, input.runId]);
+      if (existing.rows[0]?.request_digest !== input.requestDigest) throw new Error("gateway.idempotency_conflict");
+      await client.query("commit");
+      return { created: false, result: existing.rows[0]?.result ?? null };
+    }
+    const budget = await client.query(`
+      update harness_runtime.runs
+      set capability_calls = capability_calls + 1,
+          model_calls = model_calls + case when $2 then 1 else 0 end,
+          updated_at = now()
+      where run_id = $1
+        and capability_calls < $3
+        and (not $2 or model_calls < $4)
+        and cost_usd < $5::numeric
+    `, [input.runId, input.budget.modelCall, input.budget.maxCapabilityCalls,
+      input.budget.maxModelCalls, input.budget.maxCostUsd]);
+    if ((budget.rowCount ?? 0) !== 1) throw new Error("gateway.budget_denied");
+    await client.query("commit");
+    return { created: true, result: null };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-export async function completeGatewayReceipt(db: Database, result: CapabilityResult): Promise<void> {
+export async function completeGatewayReceipt(db: Database, runId: string, result: CapabilityResult): Promise<void> {
   await db.query(`
     update harness_gateway.receipts
     set result = $2::jsonb, receipt_digest = $3, completed_at = now()
-    where invocation_id = $1
-  `, [result.invocationId, JSON.stringify(result), result.receiptDigest]);
+    where invocation_id = $1 and run_id = $4
+  `, [result.invocationId, JSON.stringify(result), result.receiptDigest, runId]);
+}
+
+export async function abandonGatewayReceipt(db: Database, runId: string, invocationId: string): Promise<void> {
+  await db.query(`
+    delete from harness_gateway.receipts
+    where invocation_id = $1 and run_id = $2 and result is null
+  `, [invocationId, runId]);
 }
 
 export type GatewayReceiptRecord = {
@@ -709,6 +759,7 @@ export type GatewayReceiptRecord = {
 
 export async function listGatewayReceipts(
   db: Database,
+  tenantId: string,
   options: { runId?: string; decision?: "allowed" | "denied"; limit?: number } = {},
 ): Promise<GatewayReceiptRecord[]> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 100));
@@ -723,11 +774,12 @@ export async function listGatewayReceipts(
            permission_digest, capability_id, effect, decision, reason_code, request_digest,
            result, receipt_digest, trace_id, span_id, created_at, completed_at
     from harness_gateway.receipts
-    where ($1::text is null or run_id = $1)
-      and ($2::text is null or decision = $2)
+    where tenant_id = $1
+      and ($2::text is null or run_id = $2)
+      and ($3::text is null or decision = $3)
     order by case when decision = 'denied' then 0 else 1 end, created_at desc
-    limit $3
-  `, [options.runId ?? null, options.decision ?? null, limit]);
+    limit $4
+  `, [tenantId, options.runId ?? null, options.decision ?? null, limit]);
   return result.rows.map((row) => ({
     invocationId: row.invocation_id,
     runId: row.run_id,

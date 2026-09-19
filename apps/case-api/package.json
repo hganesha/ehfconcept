@@ -17,6 +17,7 @@
     "@ehf/identity": "workspace:*",
     "@ehf/telemetry": "workspace:*",
     "@opentelemetry/api": "1.9.1",
-    "fastify": "5.12.5"
+    "fastify": "5.12.5",
+    "tsx": "4.23.1"
   }
 }

@@ -65,10 +65,13 @@ export interface RuntimeStateStore {
   markCheckpoint(run: FencedRun, input: CheckpointMark): Promise<void>;
 }
 
+export type AccessTokenProvider = () => Promise<string>;
+export type WorkloadCredential = string | AccessTokenProvider;
+
 export type HttpRuntimeStateStoreOptions = {
   baseUrl: string;
   /** Workload credential identifying the runtime to the control plane. */
-  serviceToken: string;
+  serviceToken: WorkloadCredential;
   /** Per-invocation grant; the control plane re-checks it against the live fence. */
   executionGrant: string;
   fetchImpl?: typeof globalThis.fetch;
@@ -102,8 +105,11 @@ export class HttpRuntimeStateStore implements RuntimeStateStore {
   }
 
   private async post(path: string, run: FencedRun, body: unknown): Promise<void> {
+    const token = typeof this.options.serviceToken === "string"
+      ? this.options.serviceToken
+      : await this.options.serviceToken();
     const headers: Record<string, string> = {
-      authorization: `Bearer ${this.options.serviceToken}`,
+      authorization: `Bearer ${token}`,
       "x-runtime-grant": this.options.executionGrant,
       "content-type": "application/json",
     };

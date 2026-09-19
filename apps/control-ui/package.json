@@ -4,25 +4,28 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 4200",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start --port 4200",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node -e \"require('node:fs').rmSync('.next/types',{recursive:true,force:true});require('node:fs').rmSync('.next/dev/types',{recursive:true,force:true})\" && next typegen && tsc --noEmit",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@azure/identity": "4.13.3",
+    "@ehf/identity": "workspace:*",
     "lucide-react": "1.47.0",
-    "next": "16.2.6",
+    "next": "16.3.5",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "sharp": "0.35.4"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.1.17",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
-    "postcss": "8.5.8",
+    "eslint-config-next": "16.3.5",
+    "postcss": "8.5.28",
     "tailwindcss": "4.1.17"
   }
 }

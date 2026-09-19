@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { reserveCapabilityBudget, type Database } from "./index.js";
+import { abandonGatewayReceipt, reserveCapabilityBudget, reserveGatewayReceipt, type Database } from "./index.js";
 
 function capturing(rowCount: number): { db: Database; statements: Array<{ text: string; values: unknown[] }> } {
   const statements: Array<{ text: string; values: unknown[] }> = [];
@@ -39,5 +39,61 @@ describe("capability budget reservation", () => {
     const { db, statements } = capturing(1);
     await reserveCapabilityBudget(db, { runId: "RUN-1", modelCall: false, ...budgets });
     expect(statements[0]?.values[1]).toBe(false);
+  });
+
+  it("claims idempotency and budget in one transaction", async () => {
+    const statements: string[] = [];
+    const client = {
+      query: async (text: string) => {
+        statements.push(text);
+        if (text.includes("insert into harness_gateway.receipts")) return { rowCount: 1, rows: [{ result: null }] };
+        if (text.includes("update harness_runtime.runs")) return { rowCount: 1, rows: [] };
+        return { rowCount: 0, rows: [] };
+      },
+      release: () => {},
+    };
+    const db = { connect: async () => client } as unknown as Database;
+    await expect(reserveGatewayReceipt(db, {
+      invocationId: "INV-1", runId: "RUN-1", nodeId: "node-1", attempt: 1, fencingEpoch: 1,
+      planDigest: "a".repeat(64), permissionDigest: "b".repeat(64), capabilityId: "tool.x",
+      effect: "read", decision: "allowed", reasonCode: "permission.envelope_allowed",
+      requestDigest: "c".repeat(64), budget: { modelCall: false, ...budgets },
+    })).resolves.toEqual({ created: true, result: null });
+    expect(statements[0]).toBe("begin");
+    expect(statements.some((text) => text.includes("capability_calls = capability_calls + 1"))).toBe(true);
+    expect(statements.at(-1)).toBe("commit");
+  });
+
+  it("does not spend budget again when an invocation is replayed", async () => {
+    const statements: string[] = [];
+    const client = {
+      query: async (text: string) => {
+        statements.push(text);
+        if (text.includes("insert into harness_gateway.receipts")) return { rowCount: 0, rows: [] };
+        if (text.includes("select result, request_digest")) {
+          return { rowCount: 1, rows: [{ result: { invocationId: "INV-1" }, request_digest: "c".repeat(64) }] };
+        }
+        return { rowCount: 0, rows: [] };
+      },
+      release: () => {},
+    };
+    const db = { connect: async () => client } as unknown as Database;
+    const replay = await reserveGatewayReceipt(db, {
+      invocationId: "INV-1", runId: "RUN-1", nodeId: "node-1", attempt: 1, fencingEpoch: 1,
+      planDigest: "a".repeat(64), permissionDigest: "b".repeat(64), capabilityId: "tool.x",
+      effect: "read", decision: "allowed", reasonCode: "permission.envelope_allowed",
+      requestDigest: "c".repeat(64), budget: { modelCall: false, ...budgets },
+    });
+    expect(replay.created).toBe(false);
+    expect(statements.some((text) => text.includes("update harness_runtime.runs"))).toBe(false);
+    expect(statements.at(-1)).toBe("commit");
+  });
+
+  it("only abandons unfinished receipts owned by the run", async () => {
+    const { db, statements } = capturing(1);
+    await abandonGatewayReceipt(db, "RUN-1", "INV-1");
+    expect(statements[0]?.text).toContain("result is null");
+    expect(statements[0]?.text).toContain("run_id = $2");
+    expect(statements[0]?.values).toEqual(["INV-1", "RUN-1"]);
   });
 });

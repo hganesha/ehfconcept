@@ -21,6 +21,7 @@ import {
   type ServiceTokenGrant,
 } from "@ehf/identity";
 import {
+  abandonGatewayReceipt,
   completeGatewayReceipt,
   createDatabase,
   currentFencingEpoch,
@@ -29,7 +30,6 @@ import {
   listRegisteredCapabilities,
   recordCapabilityCost,
   registerCapability,
-  reserveCapabilityBudget,
   reserveGatewayReceipt,
   type Database,
 } from "@ehf/persistence";
@@ -103,7 +103,9 @@ export function buildGateway(options: GatewayOptions = {}) {
   const app = Fastify({ logger: true });
   const env = options.env ?? process.env;
   const db = options.db ?? createDatabase();
-  const secret = options.executionSecret ?? env.EXECUTION_ENVELOPE_SECRET ?? "";
+  const secret = options.executionSecret ?? (isAzureMode(env)
+    ? env.EXECUTION_ENVELOPE_PUBLIC_KEY_PEM
+    : env.EXECUTION_ENVELOPE_SECRET) ?? "";
   const profilesPath = options.modelProfilesPath ?? env.MODEL_PROFILES_PATH ?? "config/model-profiles.json";
   const workloadResolver = createWorkloadResolverFromEnv(options.serviceGrants ?? serviceGrantsFromEnv(env), env);
   const recordDecision = (decision: AuthorizationDecision) => {
@@ -213,6 +215,8 @@ export function buildGateway(options: GatewayOptions = {}) {
       let invocation!: CapabilityRequest;
       let plan!: HarnessPlan;
       let capability!: CapabilityDefinition;
+      let reservedInvocation: { invocationId: string; runId: string } | null = null;
+      let providerReturned = false;
       try {
         const authSpan = trace.getTracer("harness.gateway", "0.1.0").startSpan(
           "authorization.evaluate", { kind: SpanKind.INTERNAL }, context.active(),
@@ -239,16 +243,6 @@ export function buildGateway(options: GatewayOptions = {}) {
           capability = resolved;
           const run = await getRun(db, claims.run_id);
           if (!run) throw new Error("gateway.run_not_found");
-          // Reserved, not merely checked: the counters move in the same statement that
-          // tests them, so concurrent nodes cannot both pass against the same counts.
-          const reserved = await reserveCapabilityBudget(db, {
-            runId: claims.run_id,
-            modelCall: capability.kind === "model",
-            maxCapabilityCalls: plan.budgets.maxCapabilityCalls,
-            maxModelCalls: plan.budgets.maxModelCalls,
-            maxCostUsd: plan.budgets.maxCostUsd,
-          });
-          if (!reserved) throw new Error("gateway.budget_denied");
           authSpan.setAttributes({
             "harness.authorization.outcome": "ALLOWED",
             "harness.authorization.reason": "permission.envelope_allowed",
@@ -294,12 +288,19 @@ export function buildGateway(options: GatewayOptions = {}) {
           requestDigest,
           traceId: spanRef.traceId,
           spanId: spanRef.spanId,
+          budget: {
+            modelCall: capability.kind === "model",
+            maxCapabilityCalls: plan.budgets.maxCapabilityCalls,
+            maxModelCalls: plan.budgets.maxModelCalls,
+            maxCostUsd: plan.budgets.maxCostUsd,
+          },
         });
         if (!reserved.created) {
           span.setAttribute("harness.gateway.receipt_replayed", true);
           if (reserved.result) return reserved.result;
           return reply.code(409).send({ error: "gateway.invocation_in_progress" });
         }
+        reservedInvocation = { invocationId: invocation.invocationId, runId: claims.run_id };
 
         const operationName = capability.kind === "model" ? "model.inference" : "tool.execution";
         const adapter = await withSpan(operationName, {
@@ -352,12 +353,24 @@ export function buildGateway(options: GatewayOptions = {}) {
           usage: { inputTokens: adapter.inputTokens, outputTokens: adapter.outputTokens, costUsd: adapter.costUsd },
           latencyMs: Date.now() - started,
         };
+        providerReturned = true;
         const result: CapabilityResult = { ...unsigned, receiptDigest: stableDigest(unsigned) };
-        await completeGatewayReceipt(db, result);
+        await completeGatewayReceipt(db, claims.run_id, result);
         await recordCapabilityCost(db, { runId: claims.run_id, costUsd: adapter.costUsd });
         span.setAttributes({ "harness.outcome": "SUCCEEDED", "harness.gateway.receipt_replayed": false });
         return result;
       } catch (error) {
+        // A provider rejection or timeout is known not to have produced a usable
+        // result, so release this claim and allow the runtime's bounded retry to
+        // make progress. Once a provider has returned, keep the claim fail-closed:
+        // deleting it after a receipt-write failure could repeat an external effect.
+        if (reservedInvocation && !providerReturned) {
+          try {
+            await abandonGatewayReceipt(db, reservedInvocation.runId, reservedInvocation.invocationId);
+          } catch (cleanupError) {
+            request.log.error({ err: cleanupError }, "failed to release gateway invocation claim");
+          }
+        }
         const message = error instanceof Error ? error.message : "gateway.unknown";
         if (expectedDenial(message)) {
           span.setStatus({ code: SpanStatusCode.OK });
