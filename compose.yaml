@@ -96,6 +96,7 @@ services:
     environment:
       <<: *runtime-env
       CASE_API_PORT: "4102"
+      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
     ports:
       - "4102:4102"
     depends_on:

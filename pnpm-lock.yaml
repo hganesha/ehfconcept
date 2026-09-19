@@ -56,6 +56,9 @@ importers:
       '@ehf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@ehf/execution-auth':
+        specifier: workspace:*
+        version: link:../../packages/execution-auth
       '@ehf/identity':
         specifier: workspace:*
         version: link:../../packages/identity

@@ -29,6 +29,12 @@ import {
   type ServiceTokenGrant,
 } from "@ehf/identity";
 import { extractTraceContext, SpanKind, withSpan } from "@ehf/telemetry";
+import {
+  assertActorTypePermitted,
+  assertCommandWithinEnvelope,
+  isWorkload,
+  verifyCaseWriteAuthority,
+} from "./execution-authority.js";
 
 function serviceGrantsFromEnv(env: NodeJS.ProcessEnv): ServiceTokenGrant[] {
   const tenantId = env.LOCAL_DEFAULT_TENANT_ID ?? "tenant_demo";
@@ -73,6 +79,7 @@ export type CaseApiOptions = {
   store?: CaseStore;
   serviceGrants?: ServiceTokenGrant[];
   env?: NodeJS.ProcessEnv;
+  executionSecret?: string;
 };
 
 export function buildCaseApi(options: CaseApiOptions = {}) {
@@ -80,6 +87,7 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
   const env = options.env ?? process.env;
   const store = options.store ?? createCaseStore();
   const workloadResolver = createWorkloadResolverFromEnv(options.serviceGrants ?? serviceGrantsFromEnv(env), env);
+  const executionSecret = options.executionSecret ?? env.EXECUTION_ENVELOPE_SECRET ?? "";
   const recordDecision = (decision: AuthorizationDecision) => app.log.info({ authorization: decision }, "authorization decision");
   const humanGuard = createGuard({ resolver: new DelegatedPrincipalResolver(workloadResolver), onDecision: recordDecision });
   const workloadGuard = createGuard({ resolver: workloadResolver, onDecision: recordDecision });
@@ -122,6 +130,7 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
 
   app.post("/v1/cases", async (request, reply) => traced(request, "case.create", {}, async () => {
     const principal = await authorize(request, "case.write", { kind: "case" });
+    if (isWorkload(principal)) await verifyCaseWriteAuthority(request, executionSecret);
     const parsed = createKycCaseRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "case.request_invalid", issues: parsed.error.issues });
     if (parsed.data.tenantId !== principal.tenantId) return reply.code(403).send({ error: "authorization.tenant_mismatch" });
@@ -162,6 +171,12 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
     if (parsed.data.caseId !== request.params.caseId) return reply.code(400).send({ error: "command.case_id_mismatch" });
     // The command names its own tenant; that claim only holds inside the caller's.
     if (parsed.data.tenantId !== principal.tenantId) return reply.code(403).send({ error: "authorization.tenant_mismatch" });
+    if (isWorkload(principal)) {
+      // An agent writes to a case only with authority the compiled plan granted its node.
+      assertCommandWithinEnvelope(parsed.data, await verifyCaseWriteAuthority(request, executionSecret));
+    } else {
+      assertActorTypePermitted(parsed.data, principal);
+    }
     const result = await submitBusinessCommand(store, parsed.data);
     return reply.code(200).send(result);
   }));
@@ -182,6 +197,7 @@ export function buildCaseApi(options: CaseApiOptions = {}) {
 
   app.post("/v1/evidence:register", async (request, reply) => traced(request, "evidence.register", {}, async () => {
     const principal = await authorize(request, "evidence.write", { kind: "evidence" });
+    if (isWorkload(principal)) await verifyCaseWriteAuthority(request, executionSecret);
     const parsed = registerEvidenceRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "evidence.request_invalid", issues: parsed.error.issues });
     if (parsed.data.tenantId !== principal.tenantId) return reply.code(403).send({ error: "authorization.tenant_mismatch" });

@@ -13,6 +13,7 @@
   "dependencies": {
     "@ehf/case-store": "workspace:*",
     "@ehf/contracts": "workspace:*",
+    "@ehf/execution-auth": "workspace:*",
     "@ehf/identity": "workspace:*",
     "@ehf/telemetry": "workspace:*",
     "@opentelemetry/api": "1.9.1",

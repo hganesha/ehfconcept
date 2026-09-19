@@ -335,6 +335,11 @@ export async function executeCaseWrites(
     executionId: context.runId,
     roles: [],
   };
+  // Case writes are an effect, so they carry the same node-scoped authority as a
+  // capability call. The case service checks each command against the command types the
+  // plan declared for this node rather than trusting the runtime to have read the plan.
+  const issued = await requestExecutionEnvelope(context, nodeId, `${context.runId}:${nodeId}:case-writes:${context.runAttempt}`);
+  const executionHeaders = { "x-execution-envelope": issued.envelope };
   const capture = node?.config.evidenceCapture;
   if (capture && typeof capture === "object" && !Array.isArray(capture)) {
     const captureConfig = capture as Record<string, unknown>;
@@ -364,7 +369,7 @@ export async function executeCaseWrites(
     });
     const registered = await caseRequest(context, "evidence.register", "/v1/evidence:register", {
       method: "POST",
-      headers: { "idempotency-key": `${context.runId}:${context.runAttempt}:${nodeId}:evidence` },
+      headers: { ...executionHeaders, "idempotency-key": `${context.runId}:${context.runAttempt}:${nodeId}:evidence` },
       body: JSON.stringify(evidenceRequest),
     });
     const evidence = registered.evidence;
@@ -399,6 +404,7 @@ export async function executeCaseWrites(
     });
     await caseRequest(context, "case.command", `/v1/cases/${encodeURIComponent(caseId)}/commands`, {
       method: "POST",
+      headers: executionHeaders,
       body: JSON.stringify(command),
     });
     await appendEvent(context.db, {

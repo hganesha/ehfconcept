@@ -14,8 +14,11 @@ policy_digest="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 permission_digest="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 system_actor='{"type":"SYSTEM","principalId":"kyc-poc-orchestrator","roles":[]}'
-decision_actor='{"type":"AGENT","principalId":"decision-agent@poc-v1","executionId":"pending","roles":[]}'
-qa_actor='{"type":"AGENT","principalId":"qa-agent@poc-v1","executionId":"pending","roles":[]}'
+# This script orchestrates the demonstration; it is not the harness runtime. Commands it
+# submits are recorded as SYSTEM, because an AGENT-attributed command now requires an
+# execution envelope that only a running node can obtain.
+decision_actor='{"type":"SYSTEM","principalId":"kyc-poc-orchestrator/decision","roles":[]}'
+qa_actor='{"type":"SYSTEM","principalId":"kyc-poc-orchestrator/qa","roles":[]}'
 analyst_actor='{"type":"HUMAN","principalId":"poc-analyst","roles":["KYC.Analyst"]}'
 senior_actor='{"type":"HUMAN","principalId":"poc-senior-reviewer","roles":["KYC.SeniorReviewer"]}'
 
