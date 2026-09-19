@@ -48,7 +48,7 @@ if (checkpointBackend === "postgres") {
 
 const app = buildRuntimeHost({
   authToken: requiredEnv("RUNTIME_HOST_AUTH_TOKEN", "runtime_host.auth_token_missing"),
-  execute: (request) => executeRuntimeInvocation(request, {
+  execute: (request, signal) => executeRuntimeInvocation(request, {
     saver,
     gatewayUrl: process.env.CAPABILITY_GATEWAY_URL ?? "http://capability-gateway:4101",
     caseApiUrl: process.env.CASE_API_URL ?? "http://case-api:4102",
@@ -59,7 +59,7 @@ const app = buildRuntimeHost({
       contractVersion: "runtime.invocation.v1",
       checkpointBackend,
     },
-  }),
+  }, signal),
 });
 
 const close = async () => {

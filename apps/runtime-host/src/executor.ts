@@ -21,6 +21,7 @@ export type RuntimeExecutorDependencies = {
 export async function executeRuntimeInvocation(
   raw: unknown,
   dependencies: RuntimeExecutorDependencies,
+  cancellation?: AbortSignal,
 ): Promise<RuntimeInvocationResult> {
   const request = runtimeInvocationSchema.parse(raw);
   const remainingMs = new Date(request.deadlineAt).getTime() - Date.now();
@@ -55,7 +56,11 @@ export async function executeRuntimeInvocation(
       configurable: { thread_id: request.runId, checkpoint_ns: request.planDigest },
       recursionLimit: request.plan.execution.maxTransitions,
       maxConcurrency: request.plan.execution.maxConcurrency,
-      signal: AbortSignal.timeout(timeoutMs),
+      // The deadline and an explicit cancellation both stop the graph; whichever
+      // arrives first wins.
+      signal: cancellation
+        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), cancellation])
+        : AbortSignal.timeout(timeoutMs),
     });
     const checkpoint = await dependencies.saver?.getTuple({
       configurable: { thread_id: request.runId, checkpoint_ns: request.planDigest },
@@ -73,7 +78,9 @@ export async function executeRuntimeInvocation(
       providerMetadata: dependencies.providerMetadata ?? { host: "local_http" },
     };
   } catch (error) {
-    const errorCode = error instanceof Error ? error.message : "runtime.unhandled";
+    const errorCode = cancellation?.aborted
+      ? "runtime.cancelled"
+      : error instanceof Error ? error.message : "runtime.unhandled";
     return {
       contractVersion: "runtime.result.v1",
       invocationId: request.invocationId,

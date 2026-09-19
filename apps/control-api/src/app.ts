@@ -13,7 +13,7 @@ import {
 } from "@ehf/identity";
 import {
   admitPlan, createAuthoringDraft, createDatabase, createRun, getAuthoringDraft, getPlan, getRun,
-  SeparationOfDutiesError,
+  requestRunCancellation, SeparationOfDutiesError,
   getAuthoringAgent, listAuthoringAgents, listAuthoringSkills, registerAuthoringAgent, registerAuthoringSkill,
   listAuthoringDrafts, listAuthoringEvents, listEvents, listGatewayReceipts, listNodeAttempts, listPlanRecords,
   listPlans, listRegisteredCapabilities, listRuns, setAuthoringLifecycle, updateAuthoringSources, type Database,
@@ -407,6 +407,22 @@ export function buildControlApi(options: ControlApiOptions = {}) {
     const run = await getRun(db, request.params.runId, principal.tenantId);
     return run ?? reply.code(404).send({ error: "run.not_found" });
   });
+  app.post<{ Params: { runId: string }; Body: { reason?: unknown } }>("/v1/runs/:runId/cancel", async (request, reply) => {
+    const principal = await requirePrincipal(request, "run.cancel", { kind: "run", id: request.params.runId });
+    const reason = typeof request.body?.reason === "string" && request.body.reason.trim()
+      ? request.body.reason.trim().slice(0, 200)
+      : "operator_request";
+    const { outcome, run } = await requestRunCancellation(db, {
+      runId: request.params.runId, tenantId: principal.tenantId, reason,
+    });
+    if (outcome === "not_found") return reply.code(404).send({ error: "run.not_found" });
+    if (outcome === "already_terminal") return reply.code(409).send({ error: "run.already_terminal", run });
+    // "requested" means a worker is still executing: its authority is revoked now, and
+    // the run becomes terminal when it stops. Cancellation cannot unmake a committed
+    // effect, so the two states are reported separately rather than conflated.
+    return reply.code(202).send({ outcome, run });
+  });
+
   app.get<{ Params: { runId: string } }>("/v1/runs/:runId/trace", async (request, reply) => {
     const principal = await requirePrincipal(request, "run.read", { kind: "run", id: request.params.runId });
     const run = await getRun(db, request.params.runId, principal.tenantId);

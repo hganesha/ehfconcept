@@ -197,6 +197,7 @@ export const runStatusSchema = z.enum([
   "manual_review",
   "denied",
   "failed",
+  "cancelled",
 ]);
 
 export const runRequestSchema = z.object({
@@ -241,6 +242,20 @@ export const runtimeEventSchema = z.object({
 }).strict();
 
 export const runtimeProviderKindSchema = z.enum(["local_http", "azure_foundry"]);
+
+/**
+ * Provider-observed state of an invocation.
+ *
+ * Needed because a dispatcher that loses contact with a provider mid-invocation cannot
+ * otherwise tell "still running" from "finished, and the result is lost" -- and the
+ * difference decides whether a retry is safe.
+ */
+export const runtimeInvocationStatusSchema = z.object({
+  contractVersion: z.literal("runtime.status.v1"),
+  invocationId: z.string().min(1),
+  state: z.enum(["pending", "running", "completed", "failed", "cancelled", "unknown"]),
+  providerMetadata: z.record(z.string(), z.string()).default({}),
+}).strict();
 
 export const runtimeInvocationSchema = z.object({
   contractVersion: z.literal("runtime.invocation.v1"),
@@ -518,6 +533,7 @@ export type RunRecord = z.infer<typeof runRecordSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;
 export type RuntimeEvent = z.infer<typeof runtimeEventSchema>;
 export type RuntimeProviderKind = z.infer<typeof runtimeProviderKindSchema>;
+export type RuntimeInvocationStatus = z.infer<typeof runtimeInvocationStatusSchema>;
 export type RuntimeInvocation = z.infer<typeof runtimeInvocationSchema>;
 export type RuntimeInvocationResult = z.infer<typeof runtimeInvocationResultSchema>;
 export type KycCaseStatus = z.infer<typeof kycCaseStatusSchema>;

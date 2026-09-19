@@ -181,8 +181,12 @@ export async function claimRun(db: Database, workerId: string, leaseSeconds: num
     const selected = await client.query<{ run_id: string }>(`
       select run_id
       from harness_runtime.runs
-      where status in ('queued','retrying')
-         or (status = 'running' and lease_expires_at < now())
+      where (
+          (status in ('queued','retrying') and (available_at is null or available_at <= now()))
+          or (status = 'running' and lease_expires_at < now())
+        )
+        and cancellation_requested_at is null
+        and attempt < attempt_limit
       order by created_at
       for update skip locked
       limit 1
@@ -198,6 +202,7 @@ export async function claimRun(db: Database, workerId: string, leaseSeconds: num
           lease_expires_at = now() + make_interval(secs => $3),
           fencing_epoch = fencing_epoch + 1,
           attempt = attempt + 1,
+          available_at = null,
           started_at = coalesce(started_at, now()), updated_at = now()
       where run_id = $1
       returning ${runColumns}
@@ -226,6 +231,153 @@ export async function renewLease(
     where run_id = $1 and lease_owner = $2 and fencing_epoch = $3 and status = 'running'
   `, [runId, workerId, fencingEpoch, leaseSeconds]);
   return (result.rowCount ?? 0) === 1;
+}
+
+/**
+ * Release a run for another attempt after a transient failure.
+ *
+ * Fenced like every other write, so a worker that already lost its lease cannot drag a
+ * run that someone else is now executing back into the queue.
+ */
+export async function scheduleRunRetry(
+  db: Database,
+  input: { runId: string; workerId: string; fencingEpoch: number; errorCode: string; backoffMs: number },
+): Promise<boolean> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'retrying', lease_owner = null, lease_expires_at = null,
+        available_at = now() + make_interval(secs => $4),
+        error_code = $5, updated_at = now()
+    where run_id = $1 and lease_owner = $2 and fencing_epoch = $3 and status = 'running'
+      and attempt < attempt_limit
+  `, [input.runId, input.workerId, input.fencingEpoch, Math.max(0, input.backoffMs) / 1000, input.errorCode]);
+  return (result.rowCount ?? 0) === 1;
+}
+
+/** Runs that exhausted their attempt budget are terminal, not silently stuck as retrying. */
+export async function failExhaustedRuns(db: Database): Promise<number> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'failed', terminal_outcome = 'failed',
+        error_code = coalesce(error_code, 'runtime.attempts_exhausted'),
+        lease_owner = null, lease_expires_at = null, completed_at = now(), updated_at = now()
+    where status in ('queued','retrying') and attempt >= attempt_limit
+  `);
+  return result.rowCount ?? 0;
+}
+
+export type CancellationOutcome = "already_terminal" | "cancelled" | "requested" | "not_found";
+
+/**
+ * Record a cancellation request.
+ *
+ * Cancellation is a durable command, not a signal. The fence is incremented as part of
+ * the same statement, so every envelope and journal write the running attempt still
+ * holds is refused from this moment on -- which is what stops a worker that has not yet
+ * noticed from producing further effects. A run that is not yet executing goes straight
+ * to terminal; a running one is marked and the dispatcher completes it when it stops.
+ *
+ * It cannot unmake an effect already committed, so the record distinguishes a request
+ * from an effective cancellation.
+ */
+export async function requestRunCancellation(
+  db: Database,
+  input: { runId: string; tenantId: string; reason: string },
+): Promise<{ outcome: CancellationOutcome; run: RunRecord | null }> {
+  const client = await db.connect();
+  try {
+    await client.query("begin");
+    const selected = await client.query<RunRow>(
+      `select ${runColumns} from harness_runtime.runs where run_id = $1 and tenant_id = $2 for update`,
+      [input.runId, input.tenantId],
+    );
+    const current = selected.rows[0];
+    if (!current) {
+      await client.query("commit");
+      return { outcome: "not_found", run: null };
+    }
+    if (!["queued", "running", "retrying"].includes(current.status)) {
+      await client.query("commit");
+      return { outcome: "already_terminal", run: mapRun(current) };
+    }
+    const running = current.status === "running";
+    const updated = await client.query<RunRow>(`
+      update harness_runtime.runs
+      set cancellation_requested_at = now(),
+          cancellation_reason = $2,
+          fencing_epoch = fencing_epoch + 1,
+          status = case when status = 'running' then status else 'cancelled' end,
+          terminal_outcome = case when status = 'running' then terminal_outcome else 'cancelled' end,
+          completed_at = case when status = 'running' then completed_at else now() end,
+          lease_owner = case when status = 'running' then lease_owner else null end,
+          lease_expires_at = case when status = 'running' then lease_expires_at else null end,
+          updated_at = now()
+      where run_id = $1
+      returning ${runColumns}
+    `, [input.runId, input.reason]);
+    await client.query("commit");
+    const row = updated.rows[0];
+    return { outcome: running ? "requested" : "cancelled", run: row ? mapRun(row) : null };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Close out a run the requester asked to stop.
+ *
+ * Guarded by the cancellation marker rather than by the fence, because requesting the
+ * cancellation is what moved the fence: the worker that has to record the outcome is
+ * deliberately no longer the current epoch. The transition is narrow -- only a running
+ * run with a recorded request becomes cancelled -- so it cannot be used to close out
+ * anything else.
+ */
+export async function completeCancelledRun(
+  db: Database,
+  input: { runId: string; errorCode?: string },
+): Promise<boolean> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'cancelled', terminal_outcome = 'cancelled',
+        error_code = coalesce($2, error_code, 'runtime.cancelled'),
+        lease_owner = null, lease_expires_at = null,
+        completed_at = now(), updated_at = now()
+    where run_id = $1 and status = 'running' and cancellation_requested_at is not null
+  `, [input.runId, input.errorCode ?? null]);
+  return (result.rowCount ?? 0) === 1;
+}
+
+/**
+ * Finalize cancelled runs whose worker never acknowledged.
+ *
+ * A worker can die between the request and the acknowledgement. Nothing will re-claim
+ * the run -- claimRun deliberately skips cancelled runs -- so without this sweep it
+ * would sit in 'running' forever.
+ */
+export async function finalizeAbandonedCancellations(db: Database): Promise<number> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'cancelled', terminal_outcome = 'cancelled',
+        error_code = coalesce(error_code, 'runtime.cancelled_lease_expired'),
+        lease_owner = null, lease_expires_at = null,
+        completed_at = now(), updated_at = now()
+    where status = 'running' and cancellation_requested_at is not null
+      and (lease_expires_at is null or lease_expires_at < now())
+  `);
+  return result.rowCount ?? 0;
+}
+
+/** Has a cancellation been requested for this run? Polled by the worker's heartbeat. */
+export async function cancellationRequested(db: Database, runId: string): Promise<string | null> {
+  const result = await db.query<{ cancellation_reason: string | null; cancellation_requested_at: Date | null }>(
+    "select cancellation_reason, cancellation_requested_at from harness_runtime.runs where run_id = $1",
+    [runId],
+  );
+  const row = result.rows[0];
+  return row?.cancellation_requested_at ? row.cancellation_reason ?? "cancelled" : null;
 }
 
 export async function currentFencingEpoch(db: Database, runId: string): Promise<number | null> {
@@ -295,7 +447,7 @@ export async function completeRun(
     runId: string;
     workerId: string;
     fencingEpoch: number;
-    status: "completed" | "manual_review" | "denied" | "failed";
+    status: "completed" | "manual_review" | "denied" | "failed" | "cancelled";
     terminalOutcome: string;
     output: unknown;
     errorCode?: string;
