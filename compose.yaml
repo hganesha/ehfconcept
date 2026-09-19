@@ -39,6 +39,14 @@ services:
       CASE_ARTIFACT_BACKEND: ${CASE_ARTIFACT_BACKEND:-postgres}
       CASE_EVIDENCE_REQUIRE_SCAN: ${CASE_EVIDENCE_REQUIRE_SCAN:-false}
       CASE_EVIDENCE_MAX_BYTES: ${CASE_EVIDENCE_MAX_BYTES:-1048576}
+      PLATFORM_MODE: ${PLATFORM_MODE:-local}
+      IDENTITY_PROVIDER: ${IDENTITY_PROVIDER:-local_headers}
+      LOCAL_DEFAULT_TENANT_ID: ${CASE_UI_TENANT_ID:-tenant_demo}
+      # Workload credentials for the local stack. Azure mode refuses to start when these
+      # are present; managed-identity Entra tokens replace them.
+      EDGE_SERVICE_TOKEN: ${EDGE_SERVICE_TOKEN:-local-edge-service-token-change-before-sharing}
+      RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}
+      RUNTIME_GRANT_SECRET: ${RUNTIME_GRANT_SECRET:-local-runtime-grant-secret-change-before-share}
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,6 +57,7 @@ services:
     environment:
       <<: *runtime-env
       CONTROL_API_PORT: "4100"
+      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
     ports:
       - "4100:4100"
     depends_on:
@@ -87,6 +96,9 @@ services:
     environment:
       <<: *runtime-env
       CASE_API_PORT: "4102"
+      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
+      OUTBOX_INTERVAL_MS: ${OUTBOX_INTERVAL_MS:-5000}
+      OUTBOX_RETENTION_DAYS: ${OUTBOX_RETENTION_DAYS:-7}
     ports:
       - "4102:4102"
     depends_on:
@@ -102,13 +114,20 @@ services:
 
   runtime-host-local:
     build: .
+    # Holds no envelope signing key and no run journal credential: it exchanges the
+    # dispatcher's grant for a per-node envelope at the control plane, and journals
+    # through it too. The only database handle left is the LangGraph checkpoint store,
+    # which RUNTIME_CHECKPOINT_BACKEND=memory removes entirely at the cost of resumability.
     # Invoke the checked-in runtime directly so the read-only container never
     # asks pnpm to repair or relink the workspace at startup.
     command: ./node_modules/.bin/tsx apps/runtime-host/src/server.ts
     environment:
+      RUNTIME_CHECKPOINT_BACKEND: ${RUNTIME_CHECKPOINT_BACKEND:-postgres}
       RUNTIME_CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ehf
       RUNTIME_HOST_AUTH_TOKEN: ${RUNTIME_HOST_AUTH_TOKEN:-local-runtime-host-token-change-before-sharing}
-      EXECUTION_ENVELOPE_SECRET: ${EXECUTION_ENVELOPE_SECRET:-local-poc-secret-change-before-sharing}
+      RUNTIME_SERVICE_TOKEN: ${RUNTIME_SERVICE_TOKEN:-local-runtime-service-token-change-before-share}
+      PLATFORM_MODE: ${PLATFORM_MODE:-local}
+      ENVELOPE_BROKER_URL: http://control-api:4100
       CAPABILITY_GATEWAY_URL: http://capability-gateway:4101
       CASE_API_URL: http://case-api:4102
       RUNTIME_HOST_PORT: "8088"
@@ -123,6 +142,8 @@ services:
       capability-gateway:
         condition: service_healthy
       case-api:
+        condition: service_healthy
+      control-api:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -148,6 +169,9 @@ services:
       FOUNDRY_TOKEN_SCOPE: ${FOUNDRY_TOKEN_SCOPE:-https://ai.azure.com/.default}
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
       WORKER_LEASE_SECONDS: "60"
+      WORKER_RETRY_BASE_MS: ${WORKER_RETRY_BASE_MS:-2000}
+      WORKER_RETRY_MAX_MS: ${WORKER_RETRY_MAX_MS:-60000}
+      RUNTIME_GRANT_SECRET: ${RUNTIME_GRANT_SECRET:-local-runtime-grant-secret-change-before-share}
     depends_on:
       runtime-host-local:
         condition: service_healthy
@@ -165,6 +189,11 @@ services:
       CAPABILITY_GATEWAY_INTERNAL_URL: http://capability-gateway:4101
       CASE_API_INTERNAL_URL: http://case-api:4102
       CASE_UI_TENANT_ID: ${CASE_UI_TENANT_ID:-tenant_demo}
+      EDGE_SERVICE_TOKEN: ${EDGE_SERVICE_TOKEN:-local-edge-service-token-change-before-sharing}
+      CONTROL_UI_ACTOR_ID: ${CONTROL_UI_ACTOR_ID:-local-author}
+      CONTROL_UI_ACTOR_ROLES: ${CONTROL_UI_ACTOR_ROLES:-Harness.Reader,Harness.Author,Harness.Operator,Case.Analyst,Case.Reviewer}
+      CONTROL_UI_APPROVER_ID: ${CONTROL_UI_APPROVER_ID:-local-approver}
+      CONTROL_UI_APPROVER_ROLES: ${CONTROL_UI_APPROVER_ROLES:-Harness.Reader,Harness.Approver}
       JAEGER_API_INTERNAL_URL: http://jaeger:16686
       TRACE_VIEWER_PUBLIC_URL: http://localhost:16686
       CONTROL_UI_VERSION: 0.1.0

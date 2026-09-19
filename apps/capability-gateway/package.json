@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts"
   },
@@ -14,6 +14,7 @@
     "@ehf/adapters": "workspace:*",
     "@ehf/contracts": "workspace:*",
     "@ehf/execution-auth": "workspace:*",
+    "@ehf/identity": "workspace:*",
     "@ehf/persistence": "workspace:*",
     "@ehf/telemetry": "workspace:*",
     "@opentelemetry/api": "1.9.1",

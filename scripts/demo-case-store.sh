@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+
 case_api_url="${CASE_API_URL:-http://localhost:4102}"
 control_api_url="${CONTROL_API_URL:-http://localhost:4100}"
 tenant_id="${CASE_DEMO_TENANT_ID:-tenant_demo}"
 demo_id="${CASE_DEMO_ID:-$(date +%s)-$$}"
 policy_digest="${CASE_DEMO_POLICY_DIGEST:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
 permission_digest="${CASE_DEMO_PERMISSION_DIGEST:-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}"
-plan_digest="$(curl -fsS "${control_api_url}/v1/plans" | jq -r '.plans[] | select(.metadata.domain == "kyc") | .planDigest' | head -n 1)"
+plan_digest="$(curl -fsS "${edge_auth[@]}" "${control_api_url}/v1/plans" | jq -r '.plans[] | select(.metadata.domain == "kyc") | .planDigest' | head -n 1)"
 
 if [[ -z "${plan_digest}" ]]; then
   echo "No admitted KYC plan found. Run make demo first." >&2
@@ -21,7 +23,7 @@ create_body="$(jq -n \
   --arg harnessPlanDigest "${plan_digest}" \
   --argjson actor "${actor}" \
   '{tenantId:$tenantId, policySnapshotDigest:$policySnapshotDigest, harnessPlanDigest:$harnessPlanDigest, actor:$actor}')"
-created="$(curl -fsS -X POST "${case_api_url}/v1/cases" \
+created="$(curl -fsS "${edge_auth[@]}" -X POST "${case_api_url}/v1/cases" \
   -H 'content-type: application/json' \
   -H "idempotency-key: demo:kyc:case:${demo_id}" \
   --data-binary "${create_body}")"
@@ -33,7 +35,7 @@ command() {
   local payload="$3"
   local body
   local sequence
-  sequence="$(curl -fsS "${case_api_url}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}" | jq -r '.case.caseSequence')"
+  sequence="$(curl -fsS "${edge_auth[@]}" "${case_api_url}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}" | jq -r '.case.caseSequence')"
   body="$(jq -n \
     --arg commandId "cmd_demo_${demo_id}_${command_suffix}" \
     --arg commandType "${command_type}" \
@@ -49,7 +51,7 @@ command() {
     --argjson caseSequence "${sequence}" \
     '{commandId:$commandId,commandType:$commandType,commandVersion:$commandVersion,tenantId:$tenantId,caseId:$caseId,actor:$actor,authority:{planDigest:$planDigest,permissionEnvelopeDigest:$permissionEnvelopeDigest,policySnapshotDigest:$policySnapshotDigest},payload:$payload,preconditions:{caseSequence:$caseSequence},idempotencyKey:$idempotencyKey}')"
   local response
-  response="$(curl -fsS -X POST "${case_api_url}/v1/cases/${case_id}/commands" -H 'content-type: application/json' --data-binary "${body}")"
+  response="$(curl -fsS "${edge_auth[@]}" -X POST "${case_api_url}/v1/cases/${case_id}/commands" -H 'content-type: application/json' --data-binary "${body}")"
   printf '%s' "${response}"
 }
 
@@ -64,7 +66,7 @@ evidence_body="$(jq -n \
   --arg subjectRef "${subject_id}" \
   --argjson createdBy "${actor}" \
   '{tenantId:$tenantId,caseId:$caseId,type:"screening_result",mediaType:"application/json",contentBase64:$contentBase64,source:{type:"TOOL",dataset:"sanctions-global",datasetVersion:"2026-09-17",capability:"screening.sanctions.search@3.2.0",retrievedAt:"2026-09-17T18:41:12.481Z"},subjectRefs:[$subjectRef],trust:{tier:"LICENSED_PROVIDER",instructionTrust:"UNTRUSTED_DATA"},createdBy:$createdBy}')"
-evidence_result="$(curl -fsS -X POST "${case_api_url}/v1/evidence:register" -H 'content-type: application/json' -H "idempotency-key: ${tenant_id}:${case_id}:${demo_id}:screening-evidence" --data-binary "${evidence_body}")"
+evidence_result="$(curl -fsS "${edge_auth[@]}" -X POST "${case_api_url}/v1/evidence:register" -H 'content-type: application/json' -H "idempotency-key: ${tenant_id}:${case_id}:${demo_id}:screening-evidence" --data-binary "${evidence_body}")"
 evidence_id="$(jq -r '.evidence.evidenceId' <<<"${evidence_result}")"
 
 command LinkEvidence link_evidence "$(jq -n --arg evidenceId "${evidence_id}" '{evidenceId:$evidenceId,purpose:"KYC_SCREENING"}')" >/dev/null
@@ -76,8 +78,8 @@ command RecordScreeningFinding screening_finding "$(jq -n --arg subjectRef "${su
 command TransitionCaseStatus transition_validating '{"toStatus":"VALIDATING","reason":"Validated intake is ready for screening."}' >/dev/null
 command TransitionCaseStatus transition_screening '{"toStatus":"SCREENING","reason":"Identity validation complete."}' >/dev/null
 
-case_view="$(curl -fsS "${case_api_url}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}")"
-verification="$(curl -fsS -X POST "${case_api_url}/v1/cases/${case_id}/ledger:verify" -H "x-tenant-id: ${tenant_id}")"
+case_view="$(curl -fsS "${edge_auth[@]}" "${case_api_url}/v1/cases/${case_id}" -H "x-tenant-id: ${tenant_id}")"
+verification="$(curl -fsS "${edge_auth[@]}" -X POST "${case_api_url}/v1/cases/${case_id}/ledger:verify" -H "x-tenant-id: ${tenant_id}")"
 
 jq -n \
   --arg caseId "${case_id}" \

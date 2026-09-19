@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -12,7 +14,7 @@
   "dependencies": {
     "@ehf/contracts": "workspace:*",
     "@ehf/execution-auth": "workspace:*",
-    "@ehf/persistence": "workspace:*",
+    "@ehf/runtime-state": "workspace:*",
     "@ehf/telemetry": "workspace:*"
   }
 }

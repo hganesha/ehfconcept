@@ -6,6 +6,7 @@ import {
   evaluationReportSchema,
   harnessPlanSchema,
   stableDigest,
+  verifyPlanDigest,
   skillRegistrationSchema,
   type AgentRegistration,
   type AuthoringStatus,
@@ -84,36 +85,53 @@ const runColumns = `run_id, idempotency_key, plan_digest, status, terminal_outco
   fencing_epoch, latest_checkpoint_id, current_node_id, error_code, trace_id, root_span_id, trace_flags, cost_usd, cost_complete, model_calls,
   capability_calls, created_at, started_at, completed_at, updated_at`;
 
-export async function admitPlan(db: Database, input: unknown): Promise<{ created: boolean; plan: HarnessPlan }> {
+export async function admitPlan(db: Database, input: unknown, tenantId: string): Promise<{ created: boolean; plan: HarnessPlan }> {
   const plan = harnessPlanSchema.parse(input);
+  // Admission is the only gate between an arbitrary document and something the
+  // dispatcher will execute and the gateway will treat as authority. Recompute the
+  // digest before the insert: a plan whose content does not hash to its claimed
+  // digest must never reach the table, because every later check -- permission
+  // envelopes, capability resolution, case-command authority -- keys off that digest.
+  if (!verifyPlanDigest(plan)) throw new Error("plan.digest_invalid");
   const result = await db.query(`
-    insert into harness_control.plans(plan_digest, plan_id, name, domain, version, plan)
-    values ($1, $2, $3, $4, $5, $6::jsonb)
+    insert into harness_control.plans(plan_digest, plan_id, name, domain, version, plan, tenant_id)
+    values ($1, $2, $3, $4, $5, $6::jsonb, $7)
     on conflict (plan_digest) do nothing
-  `, [plan.planDigest, plan.planId, plan.metadata.name, plan.metadata.domain, plan.metadata.version, JSON.stringify(plan)]);
+  `, [plan.planDigest, plan.planId, plan.metadata.name, plan.metadata.domain, plan.metadata.version, JSON.stringify(plan), tenantId]);
   return { created: (result.rowCount ?? 0) > 0, plan };
 }
 
-export async function getPlan(db: Database, digest: string): Promise<HarnessPlan | null> {
-  const result = await db.query<{ plan: unknown }>(
-    "select plan from harness_control.plans where plan_digest = $1",
-    [digest],
-  );
+/**
+ * Read an admitted plan.
+ *
+ * `tenantId` scopes the read to a caller's assignment. It is omitted by components
+ * acting on behalf of a run that has already been authorized -- the gateway verifying an
+ * envelope, the dispatcher executing a claimed run -- where the plan digest itself is
+ * the authority and there is no caller tenant to check against.
+ */
+export async function getPlan(db: Database, digest: string, tenantId?: string): Promise<HarnessPlan | null> {
+  const result = tenantId
+    ? await db.query<{ plan: unknown }>(
+      "select plan from harness_control.plans where plan_digest = $1 and tenant_id = $2", [digest, tenantId])
+    : await db.query<{ plan: unknown }>(
+      "select plan from harness_control.plans where plan_digest = $1", [digest]);
   return result.rows[0] ? harnessPlanSchema.parse(result.rows[0].plan) : null;
 }
 
-export async function listPlans(db: Database): Promise<HarnessPlan[]> {
+export async function listPlans(db: Database, tenantId: string): Promise<HarnessPlan[]> {
   const result = await db.query<{ plan: unknown }>(
-    "select plan from harness_control.plans order by admitted_at desc limit 100",
+    "select plan from harness_control.plans where tenant_id = $1 order by admitted_at desc limit 100",
+    [tenantId],
   );
   return result.rows.map((row) => harnessPlanSchema.parse(row.plan));
 }
 
 export type PlanRecord = { plan: HarnessPlan; admittedAt: string };
 
-export async function listPlanRecords(db: Database): Promise<PlanRecord[]> {
+export async function listPlanRecords(db: Database, tenantId: string): Promise<PlanRecord[]> {
   const result = await db.query<{ plan: unknown; admitted_at: Date }>(
-    "select plan, admitted_at from harness_control.plans order by admitted_at desc limit 100",
+    "select plan, admitted_at from harness_control.plans where tenant_id = $1 order by admitted_at desc limit 100",
+    [tenantId],
   );
   return result.rows.map((row) => ({
     plan: harnessPlanSchema.parse(row.plan),
@@ -123,32 +141,33 @@ export async function listPlanRecords(db: Database): Promise<PlanRecord[]> {
 
 export async function createRun(
   db: Database,
-  input: { planDigest: string; runInput: unknown; idempotencyKey: string },
+  input: { planDigest: string; runInput: unknown; idempotencyKey: string; tenantId: string },
 ): Promise<{ created: boolean; run: RunRecord }> {
   const runId = `RUN-${randomUUID()}`;
   const result = await db.query<RunRow>(`
-    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input)
-    values ($1, $2, $3, 'queued', $4::jsonb)
+    insert into harness_runtime.runs(run_id, idempotency_key, plan_digest, status, input, tenant_id)
+    values ($1, $2, $3, 'queued', $4::jsonb, $5)
     on conflict (idempotency_key) do update set updated_at = harness_runtime.runs.updated_at
     returning ${runColumns}
-  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput)]);
+  `, [runId, input.idempotencyKey, input.planDigest, JSON.stringify(input.runInput), input.tenantId]);
   const row = result.rows[0];
   if (!row) throw new Error("run.create_failed");
   return { created: row.run_id === runId, run: mapRun(row) };
 }
 
-export async function getRun(db: Database, runId: string): Promise<RunRecord | null> {
-  const result = await db.query<RunRow>(
-    `select ${runColumns} from harness_runtime.runs where run_id = $1`,
-    [runId],
-  );
+export async function getRun(db: Database, runId: string, tenantId?: string): Promise<RunRecord | null> {
+  const result = tenantId
+    ? await db.query<RunRow>(
+      `select ${runColumns} from harness_runtime.runs where run_id = $1 and tenant_id = $2`, [runId, tenantId])
+    : await db.query<RunRow>(
+      `select ${runColumns} from harness_runtime.runs where run_id = $1`, [runId]);
   return result.rows[0] ? mapRun(result.rows[0]) : null;
 }
 
-export async function listRuns(db: Database, limit = 100): Promise<RunRecord[]> {
+export async function listRuns(db: Database, tenantId: string, limit = 100): Promise<RunRecord[]> {
   const result = await db.query<RunRow>(
-    `select ${runColumns} from harness_runtime.runs order by updated_at desc limit $1`,
-    [Math.max(1, Math.min(100, limit))],
+    `select ${runColumns} from harness_runtime.runs where tenant_id = $1 order by updated_at desc limit $2`,
+    [tenantId, Math.max(1, Math.min(100, limit))],
   );
   return result.rows.map(mapRun);
 }
@@ -162,8 +181,12 @@ export async function claimRun(db: Database, workerId: string, leaseSeconds: num
     const selected = await client.query<{ run_id: string }>(`
       select run_id
       from harness_runtime.runs
-      where status in ('queued','retrying')
-         or (status = 'running' and lease_expires_at < now())
+      where (
+          (status in ('queued','retrying') and (available_at is null or available_at <= now()))
+          or (status = 'running' and lease_expires_at < now())
+        )
+        and cancellation_requested_at is null
+        and attempt < attempt_limit
       order by created_at
       for update skip locked
       limit 1
@@ -179,6 +202,7 @@ export async function claimRun(db: Database, workerId: string, leaseSeconds: num
           lease_expires_at = now() + make_interval(secs => $3),
           fencing_epoch = fencing_epoch + 1,
           attempt = attempt + 1,
+          available_at = null,
           started_at = coalesce(started_at, now()), updated_at = now()
       where run_id = $1
       returning ${runColumns}
@@ -207,6 +231,153 @@ export async function renewLease(
     where run_id = $1 and lease_owner = $2 and fencing_epoch = $3 and status = 'running'
   `, [runId, workerId, fencingEpoch, leaseSeconds]);
   return (result.rowCount ?? 0) === 1;
+}
+
+/**
+ * Release a run for another attempt after a transient failure.
+ *
+ * Fenced like every other write, so a worker that already lost its lease cannot drag a
+ * run that someone else is now executing back into the queue.
+ */
+export async function scheduleRunRetry(
+  db: Database,
+  input: { runId: string; workerId: string; fencingEpoch: number; errorCode: string; backoffMs: number },
+): Promise<boolean> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'retrying', lease_owner = null, lease_expires_at = null,
+        available_at = now() + make_interval(secs => $4),
+        error_code = $5, updated_at = now()
+    where run_id = $1 and lease_owner = $2 and fencing_epoch = $3 and status = 'running'
+      and attempt < attempt_limit
+  `, [input.runId, input.workerId, input.fencingEpoch, Math.max(0, input.backoffMs) / 1000, input.errorCode]);
+  return (result.rowCount ?? 0) === 1;
+}
+
+/** Runs that exhausted their attempt budget are terminal, not silently stuck as retrying. */
+export async function failExhaustedRuns(db: Database): Promise<number> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'failed', terminal_outcome = 'failed',
+        error_code = coalesce(error_code, 'runtime.attempts_exhausted'),
+        lease_owner = null, lease_expires_at = null, completed_at = now(), updated_at = now()
+    where status in ('queued','retrying') and attempt >= attempt_limit
+  `);
+  return result.rowCount ?? 0;
+}
+
+export type CancellationOutcome = "already_terminal" | "cancelled" | "requested" | "not_found";
+
+/**
+ * Record a cancellation request.
+ *
+ * Cancellation is a durable command, not a signal. The fence is incremented as part of
+ * the same statement, so every envelope and journal write the running attempt still
+ * holds is refused from this moment on -- which is what stops a worker that has not yet
+ * noticed from producing further effects. A run that is not yet executing goes straight
+ * to terminal; a running one is marked and the dispatcher completes it when it stops.
+ *
+ * It cannot unmake an effect already committed, so the record distinguishes a request
+ * from an effective cancellation.
+ */
+export async function requestRunCancellation(
+  db: Database,
+  input: { runId: string; tenantId: string; reason: string },
+): Promise<{ outcome: CancellationOutcome; run: RunRecord | null }> {
+  const client = await db.connect();
+  try {
+    await client.query("begin");
+    const selected = await client.query<RunRow>(
+      `select ${runColumns} from harness_runtime.runs where run_id = $1 and tenant_id = $2 for update`,
+      [input.runId, input.tenantId],
+    );
+    const current = selected.rows[0];
+    if (!current) {
+      await client.query("commit");
+      return { outcome: "not_found", run: null };
+    }
+    if (!["queued", "running", "retrying"].includes(current.status)) {
+      await client.query("commit");
+      return { outcome: "already_terminal", run: mapRun(current) };
+    }
+    const running = current.status === "running";
+    const updated = await client.query<RunRow>(`
+      update harness_runtime.runs
+      set cancellation_requested_at = now(),
+          cancellation_reason = $2,
+          fencing_epoch = fencing_epoch + 1,
+          status = case when status = 'running' then status else 'cancelled' end,
+          terminal_outcome = case when status = 'running' then terminal_outcome else 'cancelled' end,
+          completed_at = case when status = 'running' then completed_at else now() end,
+          lease_owner = case when status = 'running' then lease_owner else null end,
+          lease_expires_at = case when status = 'running' then lease_expires_at else null end,
+          updated_at = now()
+      where run_id = $1
+      returning ${runColumns}
+    `, [input.runId, input.reason]);
+    await client.query("commit");
+    const row = updated.rows[0];
+    return { outcome: running ? "requested" : "cancelled", run: row ? mapRun(row) : null };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Close out a run the requester asked to stop.
+ *
+ * Guarded by the cancellation marker rather than by the fence, because requesting the
+ * cancellation is what moved the fence: the worker that has to record the outcome is
+ * deliberately no longer the current epoch. The transition is narrow -- only a running
+ * run with a recorded request becomes cancelled -- so it cannot be used to close out
+ * anything else.
+ */
+export async function completeCancelledRun(
+  db: Database,
+  input: { runId: string; errorCode?: string },
+): Promise<boolean> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'cancelled', terminal_outcome = 'cancelled',
+        error_code = coalesce($2, error_code, 'runtime.cancelled'),
+        lease_owner = null, lease_expires_at = null,
+        completed_at = now(), updated_at = now()
+    where run_id = $1 and status = 'running' and cancellation_requested_at is not null
+  `, [input.runId, input.errorCode ?? null]);
+  return (result.rowCount ?? 0) === 1;
+}
+
+/**
+ * Finalize cancelled runs whose worker never acknowledged.
+ *
+ * A worker can die between the request and the acknowledgement. Nothing will re-claim
+ * the run -- claimRun deliberately skips cancelled runs -- so without this sweep it
+ * would sit in 'running' forever.
+ */
+export async function finalizeAbandonedCancellations(db: Database): Promise<number> {
+  const result = await db.query(`
+    update harness_runtime.runs
+    set status = 'cancelled', terminal_outcome = 'cancelled',
+        error_code = coalesce(error_code, 'runtime.cancelled_lease_expired'),
+        lease_owner = null, lease_expires_at = null,
+        completed_at = now(), updated_at = now()
+    where status = 'running' and cancellation_requested_at is not null
+      and (lease_expires_at is null or lease_expires_at < now())
+  `);
+  return result.rowCount ?? 0;
+}
+
+/** Has a cancellation been requested for this run? Polled by the worker's heartbeat. */
+export async function cancellationRequested(db: Database, runId: string): Promise<string | null> {
+  const result = await db.query<{ cancellation_reason: string | null; cancellation_requested_at: Date | null }>(
+    "select cancellation_reason, cancellation_requested_at from harness_runtime.runs where run_id = $1",
+    [runId],
+  );
+  const row = result.rows[0];
+  return row?.cancellation_requested_at ? row.cancellation_reason ?? "cancelled" : null;
 }
 
 export async function currentFencingEpoch(db: Database, runId: string): Promise<number | null> {
@@ -276,7 +447,7 @@ export async function completeRun(
     runId: string;
     workerId: string;
     fencingEpoch: number;
-    status: "completed" | "manual_review" | "denied" | "failed";
+    status: "completed" | "manual_review" | "denied" | "failed" | "cancelled";
     terminalOutcome: string;
     output: unknown;
     errorCode?: string;
@@ -579,19 +750,54 @@ export async function listGatewayReceipts(
   }));
 }
 
-export async function recordCapabilityUsage(
+/**
+ * Claim one capability call against a run's budget.
+ *
+ * The gateway used to read the counters, decide, call the provider, and only then record
+ * the usage. Two nodes running concurrently both passed the check against the same
+ * stale counts and both spent, so a plan could exceed its own budget -- at
+ * maxConcurrency 1 it never showed, at 32 it would. The check and the increment are one
+ * statement, so the budget is a reservation rather than an observation.
+ *
+ * A reservation is not released when the call fails: an attempt that reached a paid
+ * provider may have cost money whatever it returned, and a budget that refunds failures
+ * can be spent indefinitely by failing.
+ */
+export async function reserveCapabilityBudget(
   db: Database,
-  input: { runId: string; modelCall: boolean; costUsd: number | null },
-): Promise<void> {
-  await db.query(`
+  input: {
+    runId: string;
+    modelCall: boolean;
+    maxCapabilityCalls: number;
+    maxModelCalls: number;
+    maxCostUsd: number;
+  },
+): Promise<boolean> {
+  const result = await db.query(`
     update harness_runtime.runs
     set capability_calls = capability_calls + 1,
         model_calls = model_calls + case when $2 then 1 else 0 end,
-        cost_usd = cost_usd + coalesce($3::numeric, 0::numeric),
-        cost_complete = cost_complete and ($3 is not null),
         updated_at = now()
     where run_id = $1
-  `, [input.runId, input.modelCall, input.costUsd]);
+      and capability_calls < $3
+      and (not $2 or model_calls < $4)
+      and cost_usd < $5::numeric
+  `, [input.runId, input.modelCall, input.maxCapabilityCalls, input.maxModelCalls, input.maxCostUsd]);
+  return (result.rowCount ?? 0) === 1;
+}
+
+/** Add the realized cost of a reserved call once the provider has reported it. */
+export async function recordCapabilityCost(
+  db: Database,
+  input: { runId: string; costUsd: number | null },
+): Promise<void> {
+  await db.query(`
+    update harness_runtime.runs
+    set cost_usd = cost_usd + coalesce($2::numeric, 0::numeric),
+        cost_complete = cost_complete and ($2 is not null),
+        updated_at = now()
+    where run_id = $1
+  `, [input.runId, input.costUsd]);
 }
 
 export type AuthoringDiagnostic = {
@@ -658,17 +864,17 @@ const authoringColumns = `draft_id, name, domain, version, status, revision, pac
 export async function createAuthoringDraft(db: Database, input: {
   packageSource: string; workflowSource: string; parsedPackage: Record<string, unknown>;
   parsedWorkflow: Record<string, unknown>; name: string; domain: string; version: string;
-  diagnostics: AuthoringDiagnostic[]; actor: string;
+  diagnostics: AuthoringDiagnostic[]; actor: string; tenantId: string;
 }): Promise<AuthoringDraftRecord> {
   const draftId = `draft_${randomUUID()}`;
   const result = await db.query<AuthoringDraftRow>(`
     insert into harness_control.authoring_drafts(
       draft_id, name, domain, version, status, package_source, workflow_source,
-      parsed_package, parsed_workflow, diagnostics
-    ) values ($1, $2, $3, $4, 'DRAFT', $5, $6, $7::jsonb, $8::jsonb, $9::jsonb)
+      parsed_package, parsed_workflow, diagnostics, tenant_id
+    ) values ($1, $2, $3, $4, 'DRAFT', $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10)
     returning ${authoringColumns}
   `, [draftId, input.name, input.domain, input.version, input.packageSource, input.workflowSource,
-    JSON.stringify(input.parsedPackage), JSON.stringify(input.parsedWorkflow), JSON.stringify(input.diagnostics)]);
+    JSON.stringify(input.parsedPackage), JSON.stringify(input.parsedWorkflow), JSON.stringify(input.diagnostics), input.tenantId]);
   await db.query(`insert into harness_control.authoring_events(event_id, draft_id, revision, event_type, actor, details)
     values ($1, $2, 1, 'draft.created', $3, $4::jsonb)`,
   [`evt_${randomUUID()}`, draftId, input.actor, JSON.stringify({ source: "authoring-plane" })]);
@@ -677,14 +883,42 @@ export async function createAuthoringDraft(db: Database, input: {
   return mapAuthoringDraft(row);
 }
 
-export async function listAuthoringDrafts(db: Database): Promise<AuthoringDraftRecord[]> {
-  const result = await db.query<AuthoringDraftRow>(`select ${authoringColumns} from harness_control.authoring_drafts order by updated_at desc limit 100`);
+export async function listAuthoringDrafts(db: Database, tenantId: string): Promise<AuthoringDraftRecord[]> {
+  const result = await db.query<AuthoringDraftRow>(
+    `select ${authoringColumns} from harness_control.authoring_drafts where tenant_id = $1 order by updated_at desc limit 100`,
+    [tenantId],
+  );
   return result.rows.map(mapAuthoringDraft);
 }
 
-export async function getAuthoringDraft(db: Database, draftId: string): Promise<AuthoringDraftRecord | null> {
-  const result = await db.query<AuthoringDraftRow>(`select ${authoringColumns} from harness_control.authoring_drafts where draft_id = $1`, [draftId]);
+export async function getAuthoringDraft(db: Database, draftId: string, tenantId?: string): Promise<AuthoringDraftRecord | null> {
+  const result = tenantId
+    ? await db.query<AuthoringDraftRow>(
+      `select ${authoringColumns} from harness_control.authoring_drafts where draft_id = $1 and tenant_id = $2`, [draftId, tenantId])
+    : await db.query<AuthoringDraftRow>(
+      `select ${authoringColumns} from harness_control.authoring_drafts where draft_id = $1`, [draftId]);
   return result.rows[0] ? mapAuthoringDraft(result.rows[0]) : null;
+}
+
+/**
+ * Actors who shaped this draft's content.
+ *
+ * Read from the authoring event log rather than a denormalized column, so the check and
+ * the audit trail cannot disagree. Lifecycle transitions that only observe the draft --
+ * evaluation, approval, publication -- are not authorship.
+ */
+export async function authoringContributors(db: Database, draftId: string): Promise<string[]> {
+  const result = await db.query<{ actor: string }>(`
+    select distinct actor from harness_control.authoring_events
+    where draft_id = $1 and event_type in ('draft.created', 'draft.updated', 'draft.compiled')
+  `, [draftId]);
+  return result.rows.map((row) => row.actor);
+}
+
+export class SeparationOfDutiesError extends Error {
+  constructor(readonly actor: string) {
+    super("authoring.separation_of_duties");
+  }
 }
 
 export async function updateAuthoringSources(db: Database, draftId: string, input: {
@@ -713,6 +947,14 @@ export async function setAuthoringLifecycle(db: Database, draftId: string, input
   expectedStatus: AuthoringStatus; status: AuthoringStatus; actor: string; compiledPlan?: HarnessPlan;
   diagnostics?: AuthoringDiagnostic[]; evaluationReport?: EvaluationReport; publishedPlanDigest?: string;
 }): Promise<AuthoringDraftRecord> {
+  // approved_by used to be recorded and never compared with anything, so a single
+  // identity could author, evaluate, approve and publish its own plan. Approval and
+  // publication are the two transitions that confer authority on a plan, so they are the
+  // two that an author may not perform.
+  if (input.status === "APPROVED" || input.status === "PUBLISHED") {
+    const contributors = await authoringContributors(db, draftId);
+    if (contributors.includes(input.actor)) throw new SeparationOfDutiesError(input.actor);
+  }
   const result = await db.query<AuthoringDraftRow>(`
     update harness_control.authoring_drafts
     set status=$3,
@@ -720,6 +962,7 @@ export async function setAuthoringLifecycle(db: Database, draftId: string, input
         diagnostics=coalesce($5::jsonb, diagnostics),
         evaluation_report=coalesce($6::jsonb, evaluation_report),
         approved_by=case when $3='APPROVED' then $7 else approved_by end,
+        published_by=case when $3='PUBLISHED' then $7 else published_by end,
         published_plan_digest=coalesce($8, published_plan_digest),
         updated_at=now()
     where draft_id=$1 and status=$2

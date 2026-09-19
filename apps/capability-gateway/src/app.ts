@@ -11,14 +11,25 @@ import {
 } from "@ehf/contracts";
 import { verifyExecutionEnvelope } from "@ehf/execution-auth";
 import {
+  AuthorizationError,
+  createGuard,
+  isAzureMode,
+  createWorkloadResolverFromEnv,
+  DelegatedPrincipalResolver,
+  type AuthorizationDecision,
+  type Guard,
+  type ServiceTokenGrant,
+} from "@ehf/identity";
+import {
   completeGatewayReceipt,
   createDatabase,
   currentFencingEpoch,
   getPlan,
   getRun,
   listRegisteredCapabilities,
-  recordCapabilityUsage,
+  recordCapabilityCost,
   registerCapability,
+  reserveCapabilityBudget,
   reserveGatewayReceipt,
   type Database,
 } from "@ehf/persistence";
@@ -37,38 +48,116 @@ export type GatewayOptions = {
   db?: Database;
   executionSecret?: string;
   modelProfilesPath?: string;
+  /** Callers permitted to reach this gateway, and the roles each one holds. */
+  serviceGrants?: ServiceTokenGrant[];
+  env?: NodeJS.ProcessEnv;
 };
 
-function bearer(value: string | undefined): string {
-  if (!value?.startsWith("Bearer ")) throw new Error("gateway.authorization_missing");
-  return value.slice(7);
+/**
+ * The execution envelope travels in its own header.
+ *
+ * Transport authorization and execution authority answer different questions -- "is this
+ * workload the runtime?" and "may this run, node and attempt call these capabilities
+ * right now?" -- and a deployment needs both. Sharing the Authorization header between
+ * them makes it impossible to require both at once.
+ */
+const EXECUTION_ENVELOPE_HEADER = "x-execution-envelope";
+
+function serviceGrantsFromEnv(env: NodeJS.ProcessEnv): ServiceTokenGrant[] {
+  const tenantId = env.LOCAL_DEFAULT_TENANT_ID ?? "tenant_demo";
+  const grants: ServiceTokenGrant[] = [];
+  if (env.RUNTIME_SERVICE_TOKEN) {
+    grants.push({ token: env.RUNTIME_SERVICE_TOKEN, subjectId: "harness-runtime", roles: ["Capability.Invoke"], tenantId });
+  }
+  if (env.EDGE_SERVICE_TOKEN) {
+    grants.push({ token: env.EDGE_SERVICE_TOKEN, subjectId: "control-surface-edge", roles: ["Edge.Delegate"], tenantId });
+  }
+  return grants;
+}
+
+function envelopeToken(headers: Record<string, string | string[] | undefined>): string {
+  const value = headers[EXECUTION_ENVELOPE_HEADER];
+  const token = (Array.isArray(value) ? value[0] : value)?.trim();
+  if (!token) throw new Error("gateway.execution_envelope_missing");
+  return token;
 }
 
 function expectedDenial(code: string): boolean {
   return code.includes("denied") || code.includes("authorization") || code.includes("stale_fence");
 }
 
+/**
+ * Whether a missing provider credential may fall back to the recorded adapter.
+ *
+ * Locally the deterministic adapter is what makes the POC testable offline. In Azure a
+ * silent fallback would let a deployment report successful model calls it never made, so
+ * the absent credential has to fail closed instead.
+ */
+function recordedFallbackAllowed(env: NodeJS.ProcessEnv): boolean {
+  if (env.MODEL_RECORDED_FALLBACK === "deny") return false;
+  if (env.MODEL_RECORDED_FALLBACK === "allow") return true;
+  return !isAzureMode(env);
+}
+
 export function buildGateway(options: GatewayOptions = {}) {
   const app = Fastify({ logger: true });
+  const env = options.env ?? process.env;
   const db = options.db ?? createDatabase();
-  const secret = options.executionSecret ?? process.env.EXECUTION_ENVELOPE_SECRET ?? "";
-  const profilesPath = options.modelProfilesPath ?? process.env.MODEL_PROFILES_PATH ?? "config/model-profiles.json";
+  const secret = options.executionSecret ?? env.EXECUTION_ENVELOPE_SECRET ?? "";
+  const profilesPath = options.modelProfilesPath ?? env.MODEL_PROFILES_PATH ?? "config/model-profiles.json";
+  const workloadResolver = createWorkloadResolverFromEnv(options.serviceGrants ?? serviceGrantsFromEnv(env), env);
+  const recordDecision = (decision: AuthorizationDecision) => {
+    app.log.info({ authorization: decision }, "authorization decision");
+    const span = trace.getActiveSpan();
+    span?.setAttributes({
+      "harness.authorization.outcome": decision.outcome.toUpperCase(),
+      "harness.authorization.reason": decision.reasonCode,
+      "harness.principal.type": decision.actorType,
+    });
+  };
+  // Management routes are operated by a person through the control surface; capability
+  // invocation is a workload path and is authorized by the execution envelope below.
+  const managementGuard: Guard = createGuard({
+    resolver: new DelegatedPrincipalResolver(workloadResolver),
+    onDecision: recordDecision,
+  });
+  const workloadGuard: Guard = createGuard({ resolver: workloadResolver, onDecision: recordDecision });
+
+  app.setErrorHandler((error: unknown, _request, reply) => {
+    if (error instanceof AuthorizationError) {
+      return reply.code(error.httpStatus).send({ error: error.decision.reasonCode });
+    }
+    app.log.error(error);
+    return reply.code(500).send({ error: "gateway.internal_error" });
+  });
 
   app.get("/health/live", async () => ({ status: "ok" }));
   app.get("/health/ready", async () => {
     await db.query("select 1");
     return { status: "ready" };
   });
-  app.get("/v1/status", async () => ({
-    readiness: "Ready",
-    openRouterState: process.env.OPENROUTER_API_KEY ? "Configured" : "Missing",
-    runtimeMode: process.env.OPENROUTER_API_KEY ? "OpenRouter" : "Recorded",
-    envelopeVerifierStatus: secret ? "Verified · HMAC-SHA256 envelope-v1" : "Degraded",
-    generatedAt: new Date().toISOString(),
-  }));
-  app.get("/v1/model-profiles", async () => ({ profiles: await loadModelProfiles(profilesPath) }));
-  app.get("/v1/capabilities", async () => ({ capabilities: await listRegisteredCapabilities(db) }));
+  app.get("/v1/status", async (request) => {
+    await managementGuard.require(request, "capability.read", { kind: "gateway" });
+    return {
+      readiness: "Ready",
+      openRouterState: env.OPENROUTER_API_KEY ? "Configured" : "Missing",
+      runtimeMode: env.OPENROUTER_API_KEY ? "OpenRouter" : "Recorded",
+      envelopeVerifierStatus: secret ? "Verified · HMAC-SHA256 envelope-v1" : "Degraded",
+      generatedAt: new Date().toISOString(),
+    };
+  });
+  app.get("/v1/model-profiles", async (request) => {
+    await managementGuard.require(request, "capability.read", { kind: "model-profile" });
+    return { profiles: await loadModelProfiles(profilesPath) };
+  });
+  app.get("/v1/capabilities", async (request) => {
+    await managementGuard.require(request, "capability.read", { kind: "capability" });
+    return { capabilities: await listRegisteredCapabilities(db) };
+  });
   app.post("/v1/capabilities", async (request, reply) => {
+    // Registering a capability decides what a compiled plan may later be bound to, so it
+    // is a control-plane write. It used to be completely unauthenticated.
+    await managementGuard.require(request, "capability.register", { kind: "capability" });
     try {
       const result = await registerCapability(db, request.body);
       return reply.code(result.created ? 201 : 200).send(result);
@@ -76,7 +165,8 @@ export function buildGateway(options: GatewayOptions = {}) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : "capability.registration_invalid" });
     }
   });
-  app.post("/v1/openrouter/test", async (_request, reply) => {
+  app.post("/v1/openrouter/test", async (request, reply) => {
+    await managementGuard.require(request, "capability.read", { kind: "provider-probe" });
     const started = Date.now();
     const testedAt = new Date().toISOString();
     if (!process.env.OPENROUTER_API_KEY) {
@@ -128,7 +218,10 @@ export function buildGateway(options: GatewayOptions = {}) {
           "authorization.evaluate", { kind: SpanKind.INTERNAL }, context.active(),
         );
         try {
-          claims = await verifyExecutionEnvelope(bearer(request.headers.authorization), secret);
+          // Both credentials are required: the workload token says which service is
+          // calling, the envelope says what this run, node and attempt may do right now.
+          await workloadGuard.require(request, "capability.read", { kind: "capability" });
+          claims = await verifyExecutionEnvelope(envelopeToken(request.headers), secret);
           invocation = capabilityRequestSchema.parse(request.body);
           if (claims.jti !== invocation.invocationId) throw new Error("gateway.invocation_mismatch");
           if (!claims.capabilities.includes(invocation.capabilityId)) throw new Error("gateway.capability_denied");
@@ -146,9 +239,16 @@ export function buildGateway(options: GatewayOptions = {}) {
           capability = resolved;
           const run = await getRun(db, claims.run_id);
           if (!run) throw new Error("gateway.run_not_found");
-          if (run.capabilityCalls >= plan.budgets.maxCapabilityCalls) throw new Error("gateway.capability_budget_denied");
-          if (capability.kind === "model" && run.modelCalls >= plan.budgets.maxModelCalls) throw new Error("gateway.model_budget_denied");
-          if (run.costUsd >= plan.budgets.maxCostUsd) throw new Error("gateway.cost_budget_denied");
+          // Reserved, not merely checked: the counters move in the same statement that
+          // tests them, so concurrent nodes cannot both pass against the same counts.
+          const reserved = await reserveCapabilityBudget(db, {
+            runId: claims.run_id,
+            modelCall: capability.kind === "model",
+            maxCapabilityCalls: plan.budgets.maxCapabilityCalls,
+            maxModelCalls: plan.budgets.maxModelCalls,
+            maxCostUsd: plan.budgets.maxCostUsd,
+          });
+          if (!reserved) throw new Error("gateway.budget_denied");
           authSpan.setAttributes({
             "harness.authorization.outcome": "ALLOWED",
             "harness.authorization.reason": "permission.envelope_allowed",
@@ -221,10 +321,11 @@ export function buildGateway(options: GatewayOptions = {}) {
               return invokeModel({
                 profile,
                 input: invocation.input,
+                allowRecordedFallback: recordedFallbackAllowed(env),
                 ...(capability.outputSchema ? { outputSchema: capability.outputSchema } : {}),
-                ...(process.env.OPENROUTER_API_KEY ? { apiKey: process.env.OPENROUTER_API_KEY } : {}),
-                ...(process.env.OPENROUTER_SITE_URL ? { siteUrl: process.env.OPENROUTER_SITE_URL } : {}),
-                ...(process.env.OPENROUTER_APP_NAME ? { appName: process.env.OPENROUTER_APP_NAME } : {}),
+                ...(env.OPENROUTER_API_KEY ? { apiKey: env.OPENROUTER_API_KEY } : {}),
+                ...(env.OPENROUTER_SITE_URL ? { siteUrl: env.OPENROUTER_SITE_URL } : {}),
+                ...(env.OPENROUTER_APP_NAME ? { appName: env.OPENROUTER_APP_NAME } : {}),
               });
             })()
             : await invokeSimulator(capability.adapterBindingId.replace(/^simulator:/, ""), invocation.input);
@@ -253,9 +354,7 @@ export function buildGateway(options: GatewayOptions = {}) {
         };
         const result: CapabilityResult = { ...unsigned, receiptDigest: stableDigest(unsigned) };
         await completeGatewayReceipt(db, result);
-        await recordCapabilityUsage(db, {
-          runId: claims.run_id, modelCall: capability.kind === "model", costUsd: adapter.costUsd,
-        });
+        await recordCapabilityCost(db, { runId: claims.run_id, costUsd: adapter.costUsd });
         span.setAttributes({ "harness.outcome": "SUCCEEDED", "harness.gateway.receipt_replayed": false });
         return result;
       } catch (error) {

@@ -1,8 +1,12 @@
-.PHONY: compile check up down demo demo-case demo-kyc-e2e logs trace
+.PHONY: compile fixtures check up down demo demo-case demo-kyc-e2e logs trace
 
 compile:
 	cargo run -q -p harness-compiler -- compile domains/kyc --out artifacts/plans/kyc.plan.json
 	cargo run -q -p harness-compiler -- compile domains/invoice --out artifacts/plans/invoice.plan.json
+
+fixtures:
+	cargo run -q -p harness-compiler -- compile packages/contracts/test-fixtures/cross-compiler \
+		--out packages/contracts/test-fixtures/cross-compiler.plan.json
 
 check: compile
 	cargo test --workspace

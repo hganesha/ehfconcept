@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./runtime-state": "./src/runtime-state.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -14,6 +15,7 @@
   },
   "dependencies": {
     "@ehf/contracts": "workspace:*",
+    "@ehf/runtime-state": "workspace:*",
     "pg": "8.23.0"
   },
   "devDependencies": {

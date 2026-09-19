@@ -13,6 +13,7 @@ import {
   type HarnessPlan,
 } from "@ehf/contracts";
 import type { AuthoringDiagnostic } from "@ehf/persistence";
+import { compileWithHarnessc, HarnessCompilerError } from "./harnessc.js";
 
 type JsonMap = Record<string, unknown>;
 type PackageSource = {
@@ -214,15 +215,25 @@ export function analyzeAuthoringSources(packageSource: string, workflowSource: s
   };
 }
 
+/**
+ * Compile a draft into an immutable plan.
+ *
+ * Plan emission belongs to `harnessc` and nowhere else. This function resolves and
+ * validates the authoring surface -- which is what the editor needs rich diagnostics for
+ * -- and then hands the sources to the pinned compiler. It deliberately does not build a
+ * plan itself: a second implementation drifts, and the previous one stamped every plan
+ * with an `lgirCoreRevision` it had never run while silently producing a different
+ * dependency manifest and package digest than the compiler of record.
+ */
 export async function compileAuthoringDraft(input: {
   packageSource: string;
   workflowSource: string;
   registryCapabilities: CapabilityRegistration[];
   modelProfilesPath: string;
+  env?: NodeJS.ProcessEnv;
 }): Promise<{ plan: HarnessPlan | null; diagnostics: AuthoringDiagnostic[] }> {
   const analysis = analyzeAuthoringSources(input.packageSource, input.workflowSource);
   const pkg = analysis.parsedPackage as unknown as PackageSource;
-  const workflow = analysis.parsedWorkflow as unknown as WorkflowSource;
   const diagnostics = [...analysis.diagnostics];
   const embedded = (pkg.capabilities ?? []).flatMap((capability) => {
     const parsed = capabilityDefinitionSchema.safeParse(capability);
@@ -241,6 +252,9 @@ export async function compileAuthoringDraft(input: {
   const bindings = pkg.bindings ?? {};
   for (const [nodeId, capabilityId] of Object.entries(bindings)) {
     if (!capabilityMap.has(capabilityId)) diagnostics.push(diagnostic("compiler.capability_unresolved", `package.bindings.${nodeId}`, `Capability ${capabilityId} is neither embedded nor registered in the gateway.`));
+    else if (!embedded.some((capability) => capability.id === capabilityId)) {
+      diagnostics.push(diagnostic("compiler.capability_not_embedded", `package.bindings.${nodeId}`, `Capability ${capabilityId} must be materialized into the package before compilation.`));
+    }
   }
   skills.forEach((skill, index) => skill.allowedCapabilityIds.forEach((capabilityId) => {
     if (!capabilityMap.has(capabilityId)) diagnostics.push(diagnostic("compiler.skill_capability_unresolved", `package.skills.${index}.allowedCapabilityIds`, `Skill ${skill.id} references unresolved capability ${capabilityId}.`));
@@ -248,73 +262,37 @@ export async function compileAuthoringDraft(input: {
   agents.forEach((agent, index) => {
     if (agent.primaryCapabilityId && !capabilityMap.has(agent.primaryCapabilityId)) diagnostics.push(diagnostic("compiler.agent_capability_unresolved", `package.agents.${index}.primaryCapabilityId`, `Agent ${agent.id} references unresolved capability ${agent.primaryCapabilityId}.`));
   });
-  if (diagnostics.some((item) => item.severity === "error")) return { plan: null, diagnostics };
 
   const modelProfileRegistry = JSON.parse(await readFile(input.modelProfilesPath, "utf8")) as { profiles: JsonMap[] };
-  const modelProfiles = (pkg.modelProfiles ?? []).flatMap((id) => {
-    const profile = modelProfileRegistry.profiles.find((candidate) => candidate.id === id);
-    if (!profile) {
+  for (const id of pkg.modelProfiles ?? []) {
+    if (!modelProfileRegistry.profiles.some((candidate) => candidate.id === id)) {
       diagnostics.push(diagnostic("compiler.model_profile_missing", `package.modelProfiles.${id}`, `Model profile ${id} is not configured.`));
-      return [];
     }
-    return [{ id, digest: stableDigest(profile) }];
-  });
+  }
   if (diagnostics.some((item) => item.severity === "error")) return { plan: null, diagnostics };
 
-  const nodes = workflow.spec.nodes;
-  const edges = workflow.spec.edges;
-  const nodeOrder = topologicalOrder(nodes, edges);
-  const resolvedCapabilityIds = [...new Set(Object.values(bindings))];
-  const capabilities = resolvedCapabilityIds.map((id) => capabilityMap.get(id)).filter((value): value is CapabilityDefinition => Boolean(value));
-  const permissionEnvelopes = Object.entries(bindings).map(([nodeId, capabilityId]) => {
-    const capability = capabilityMap.get(capabilityId)!;
-    const unsigned = { nodeId, capabilities: [capabilityId], effects: [capability.effect] };
-    return { ...unsigned, digest: stableDigest(unsigned) };
-  });
-  const normalizedNodes = nodes.map((node) => ({
-    id: node.id,
-    kind: node.kind as "input" | "output" | "agent" | "tool" | "transform" | "condition" | "evaluate" | "join" | "aggregator",
-    name: node.name || node.id,
-    ...(node.summary ? { summary: node.summary } : {}),
-    ...(node.prompt ? { prompt: node.prompt } : {}),
-    ...(node.inputSchema !== undefined ? { inputSchema: node.inputSchema } : {}),
-    ...(node.outputSchema !== undefined ? { outputSchema: node.outputSchema } : {}),
-    config: { ...(node.config ?? {}), ...(bindings[node.id] ? { capabilityId: bindings[node.id] } : {}) },
-  }));
-  const normalizedEdges = edges.map((edge) => ({
-    id: edge.id,
-    from: edge.from,
-    to: edge.to,
-    kind: edge.kind as "data" | "dependency" | "control",
-    ...(edge.condition ? { condition: edge.condition } : {}),
-    ...(edge.sourcePath ? { sourcePath: edge.sourcePath } : {}),
-    ...(edge.targetPath ? { targetPath: edge.targetPath } : {}),
-  }));
-  const packageDigest = stableDigest({ packageSource: analysis.parsedPackage, workflowSource: analysis.parsedWorkflow });
-  const content = {
-    apiVersion: "harness.factory/plan-v1" as const,
-    kind: "HarnessPlan" as const,
-    packageDigest,
-    compiler: { name: "harnessc" as const, version: "0.2.0-author-plane", lgirCoreRevision: "fec01bf0fa5ff259c071439d63ad71c9979668f9" },
-    metadata: pkg.metadata,
-    execution: { engine: { kind: "langgraph-js" as const, adapterVersion: "harness-langgraph-v1" as const, profile: "poc-v1" as const }, maxTransitions: 200, maxConcurrency: workflow.spec.policies?.maxConcurrency ?? 1, durability: "sync" as const },
-    budgets: pkg.budgets,
-    schemas: { input: workflow.spec.inputs ?? {}, output: workflow.spec.outputs ?? {} },
-    modelProfiles,
-    skills,
-    agents,
-    capabilities,
-    permissionEnvelopes,
-    graph: { apiVersion: "ladder.dev/v1alpha1" as const, name: workflow.metadata.name, nodes: normalizedNodes, edges: normalizedEdges, nodeOrder },
-    dependencyManifest: [
-      { path: "package.yaml", digest: stableDigest(analysis.parsedPackage) },
-      { path: pkg.workflow || "workflow.yaml", digest: stableDigest(analysis.parsedWorkflow) },
-    ],
-  };
-  const planDigest = stableDigest(content);
-  const plan = harnessPlanSchema.parse({ ...content, planId: `${pkg.metadata.name}@${pkg.metadata.version}:${planDigest.slice(0, 12)}`, planDigest });
-  diagnostics.push(diagnostic("compiler.plan_emitted", "plan", `Immutable plan ${planDigest.slice(0, 12)} emitted.`, "info"));
-  return { plan, diagnostics };
+  try {
+    const plan = await compileWithHarnessc({
+      packageSource: input.packageSource,
+      workflowSource: input.workflowSource,
+      workflowFileName: pkg.workflow || "workflow.yaml",
+      modelProfilesPath: input.modelProfilesPath,
+      ...(input.env ? { env: input.env } : {}),
+    });
+    diagnostics.push(diagnostic(
+      "compiler.plan_emitted",
+      "plan",
+      `Immutable plan ${plan.planDigest.slice(0, 12)} emitted by ${plan.compiler.name} ${plan.compiler.version} (lgir-core ${plan.compiler.lgirCoreRevision.slice(0, 8)}).`,
+      "info",
+    ));
+    return { plan, diagnostics };
+  } catch (error) {
+    if (error instanceof HarnessCompilerError) {
+      diagnostics.push(diagnostic(error.message, "plan", error.detail));
+      return { plan: null, diagnostics };
+    }
+    throw error;
+  }
 }
 
 export function evaluateCompiledPlan(plan: HarnessPlan): EvaluationReport {
