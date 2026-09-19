@@ -1,0 +1,45 @@
+# Deployment shape checks, on demand and daily.
+#
+# Asserts what CI can assert without opening a hole in the network: every app
+# provisioned and healthy, the dispatcher never scaled to zero, exactly one
+# public app, migrations succeeded, and anonymous access to the control surface
+# refused.
+#
+# The behavioural tests (plan admission, run execution, case commands, trace
+# topology) need the private control API, so they stay interactive: runbook
+# part 10 opens an IP-restricted window and closes it immediately afterwards.
+name: smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'GitHub environment to check'
+        type: environment
+        required: true
+        default: poc
+  schedule:
+    # 07:00 UTC daily. Catches a stamp that drifted since the last deployment:
+    # an expired client secret, a restart loop, a scaled-down dispatcher.
+    - cron: '0 7 * * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  smoke:
+    name: verify stamp
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'poc' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: verify deployment shape
+        run: ./scripts/azure/smoke.sh "${{ vars.AZURE_RESOURCE_GROUP }}" "${{ vars.NAME_PREFIX || 'hf' }}"

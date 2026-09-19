@@ -1,0 +1,180 @@
+# Stage 4 of the stamp: migrations, then workloads.
+#
+# Ordering is the point of this workflow. The migration job is deployed and run
+# to completion on the new image before any service revision starts on it, so no
+# service ever runs against a schema it does not expect.
+name: deploy-apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'GitHub environment to deploy'
+        type: environment
+        required: true
+        default: poc
+      services-image:
+        description: 'Digest-pinned services image. Leave empty to build from this revision.'
+        type: string
+        required: false
+      ui-image:
+        description: 'Digest-pinned control surface image. Leave empty to build from this revision.'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: apps-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: inputs.services-image == '' || inputs.ui-image == ''
+    uses: ./.github/workflows/validate.yml
+
+  build:
+    # Only builds when digests were not supplied. Passing digests is how a
+    # validated release is promoted between environments without a rebuild.
+    if: inputs.services-image == '' || inputs.ui-image == ''
+    needs: validate
+    uses: ./.github/workflows/build-images.yml
+    with:
+      environment: ${{ inputs.environment }}
+
+  deploy:
+    name: migrate then deploy
+    needs: build
+    # Runs whether or not the build job was skipped, as long as it did not fail.
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      # Consumed directly by infra/environments/poc.apps.bicepparam.
+      SERVICES_IMAGE: ${{ inputs.services-image != '' && inputs.services-image || needs.build.outputs.services-image }}
+      UI_IMAGE: ${{ inputs.ui-image != '' && inputs.ui-image || needs.build.outputs.ui-image }}
+      SOURCE_REVISION: ${{ github.sha }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX || 'hf' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: check images are digest-pinned
+        run: |
+          set -euo pipefail
+          for image in "$SERVICES_IMAGE" "$UI_IMAGE"; do
+            if [[ "$image" != *"@sha256:"* ]]; then
+              echo "refusing to deploy '${image}': images must be pinned by digest" >&2
+              exit 1
+            fi
+          done
+          echo "services: $SERVICES_IMAGE"
+          echo "ui:       $UI_IMAGE"
+
+      # The foundation deployment is the source of truth for names and
+      # endpoints, so nothing here re-derives them.
+      - name: read foundation outputs
+        id: foundation
+        run: |
+          set -euo pipefail
+          outputs="$(az deployment group list \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --query "[?starts_with(name, 'foundation-') && properties.provisioningState=='Succeeded'] | sort_by(@, &properties.timestamp) | [-1].properties.outputs" -o json)"
+          if [[ "$outputs" == "null" || -z "$outputs" ]]; then
+            echo "no successful foundation deployment found; run deploy-foundation.yml first" >&2
+            exit 1
+          fi
+          for key in keyVaultUri registryLoginServer containerAppsEnvironmentName; do
+            echo "${key}=$(jq -r ".${key}.value" <<<"$outputs")" >> "$GITHUB_OUTPUT"
+          done
+
+      # Step 1: update the migration job to the new image, without touching any
+      # service.
+      - name: deploy migration job
+        env:
+          MIGRATION_ONLY: 'true'
+          CONTAINER_APPS_ENVIRONMENT_NAME: ${{ steps.foundation.outputs.containerAppsEnvironmentName }}
+          REGISTRY_LOGIN_SERVER: ${{ steps.foundation.outputs.registryLoginServer }}
+          KEY_VAULT_URI: ${{ steps.foundation.outputs.keyVaultUri }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "apps-migration-${{ github.run_id }}" \
+            --template-file infra/apps.bicep \
+            --parameters infra/environments/poc.apps.bicepparam \
+            -o none
+
+      # Step 2: run it and wait. A failed migration stops the deployment here,
+      # with every service still on the previous image.
+      - name: run migrations
+        run: |
+          set -euo pipefail
+          job="job-${NAME_PREFIX}-migrate"
+          az containerapp job start -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$job" -o none
+
+          execution=""
+          for _ in $(seq 1 60); do
+            execution="$(az containerapp job execution list \
+              -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$job" \
+              --query "sort_by(@, &properties.startTime) | [-1].name" -o tsv)"
+            status="$(az containerapp job execution show \
+              -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$job" --job-execution-name "$execution" \
+              --query properties.status -o tsv)"
+            echo "migration ${execution}: ${status}"
+            case "$status" in
+              Succeeded) exit 0 ;;
+              Failed|Degraded) 
+                az containerapp job logs show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$job" \
+                  --container "$job" --execution "$execution" --tail 200 || true
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "migration did not finish within ten minutes" >&2
+          exit 1
+
+      # Step 3: roll the services onto the new image.
+      - name: deploy workloads
+        id: workloads
+        env:
+          MIGRATION_ONLY: 'false'
+          CONTAINER_APPS_ENVIRONMENT_NAME: ${{ steps.foundation.outputs.containerAppsEnvironmentName }}
+          REGISTRY_LOGIN_SERVER: ${{ steps.foundation.outputs.registryLoginServer }}
+          KEY_VAULT_URI: ${{ steps.foundation.outputs.keyVaultUri }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "apps-${{ github.run_id }}" \
+            --template-file infra/apps.bicep \
+            --parameters infra/environments/poc.apps.bicepparam \
+            --query properties.outputs -o json > app-outputs.json
+
+          echo "url=$(jq -r '.controlSurfaceUrl.value' app-outputs.json)" >> "$GITHUB_OUTPUT"
+
+      - name: verify deployment shape
+        run: ./scripts/azure/smoke.sh "${{ vars.AZURE_RESOURCE_GROUP }}" "$NAME_PREFIX"
+
+      - name: summary
+        run: |
+          {
+            echo '## Workloads deployed'
+            echo
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Source revision | \`${{ github.sha }}\` |"
+            echo "| Services image | \`${SERVICES_IMAGE}\` |"
+            echo "| Control surface image | \`${UI_IMAGE}\` |"
+            echo "| Control surface | ${{ steps.workloads.outputs.url }} |"
+            echo
+            echo 'Sign-in must already be configured on the control surface app'
+            echo '(runbook parts 9.2-9.3); this workflow does not manage Entra objects.'
+          } >> "$GITHUB_STEP_SUMMARY"

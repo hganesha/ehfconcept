@@ -1,0 +1,102 @@
+# Repository validation. Runs on every push and pull request, and gates every
+# deployment workflow: nothing is built or deployed from a revision that has not
+# passed this.
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  code:
+    name: compiler, tests, typecheck, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Compiles the KYC and invoice domains to content-addressed plans, then
+      # runs the Rust workspace tests and the TypeScript check/test/build set.
+      - name: compile domain packages
+        run: make compile
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: pnpm check
+        run: pnpm check
+
+      # The plan artifacts are what deploy-time smoke tests admit to the control
+      # API, so keep them from this validated revision.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harness-plans
+          path: artifacts/plans/*.plan.json
+          if-no-files-found: error
+
+  infra:
+    name: bicep lint and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install bicep
+        run: az bicep install
+
+      # Linter settings live in infra/bicepconfig.json. Warnings fail the job:
+      # an unused parameter or a hardcoded endpoint in a template is a defect.
+      - name: build templates
+        run: |
+          set -euo pipefail
+          for template in infra/main.bicep infra/database.bicep infra/apps.bicep; do
+            echo "::group::$template"
+            az bicep build --file "$template" --stdout > /dev/null
+            echo "::endgroup::"
+          done
+
+      - name: build parameter files
+        run: |
+          set -euo pipefail
+          for params in infra/environments/*.bicepparam; do
+            echo "::group::$params"
+            az bicep build-params --file "$params" --stdout > /dev/null
+            echo "::endgroup::"
+          done
+
+  scripts:
+    name: shell script syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          # Errors only: these scripts run unattended in delivery, so a genuine
+          # defect fails the build while style preferences do not.
+          shellcheck --severity=error scripts/azure/*.sh

@@ -1,0 +1,60 @@
+# What-if on pull requests that touch infrastructure. The reviewer sees the
+# resource-level diff before the change can merge.
+#
+# Only the foundation is planned. database.bicep and apps.bicep read live
+# resources (the vault's secret, the environment's default domain, the workload
+# identities), so a what-if against an environment that does not yet have a
+# foundation reports failures that say nothing about the change under review.
+# validate.yml still compiles all three templates on every pull request.
+name: infra-plan
+
+on:
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra-plan.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  what-if:
+    name: what-if against ${{ vars.AZURE_RESOURCE_GROUP }}
+    runs-on: ubuntu-latest
+    environment: poc
+    steps:
+      - uses: actions/checkout@v5
+
+      # Workload identity federation only. There is no Azure client secret in
+      # this repository and none should ever be added.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: what-if
+        id: whatif
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters infra/environments/poc.bicepparam \
+            --result-format FullResourcePayload \
+            > whatif.txt 2>&1 || true
+          {
+            echo '## Foundation what-if'
+            echo
+            echo '```'
+            tail -c 60000 whatif.txt
+            echo '```'
+          } > whatif.md
+          cat whatif.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: what-if
+          path: whatif.txt

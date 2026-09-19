@@ -1235,6 +1235,76 @@ What it does **not** prove, and must not be claimed:
 
 ---
 
+## Part 14 — Automating this runbook
+
+Everything in parts 2 through 8 is also available as infrastructure as code in
+[`infra/`](../../infra/README.md), with GitHub Actions workflows in
+[`.github/workflows/`](../../.github/workflows). Those close `AZ-008` and
+`AZ-009` in the migration plan. This part is the map between the two.
+
+### Which parts are automated
+
+| Runbook part | Automated by | Notes |
+| --- | --- | --- |
+| 1.1–1.3 Entra app, app roles, user assignment | — | Directory objects; ARM cannot create them. Stays manual. |
+| 1.4 Resource group | — | Created once; the deployment identity is scoped to it. |
+| 1.5 Workload identities | `infra/main.bicep` | One per workload, same names. |
+| 1.6 GitHub OIDC identity | — | Bootstrap once, then the workflows use it. |
+| 2.1–2.4 Network, ACR, monitoring, Key Vault | `infra/main.bicep` | |
+| 2.5 PostgreSQL | `infra/database.bicep` | Reads its password from the vault. |
+| 3 Role assignments | `infra/modules/rbac.bicep` | |
+| 4 Secrets | `scripts/azure/seed-secrets.sh` | Generates only what is absent; never rotates in place. |
+| 5 Images | `.github/workflows/build-images.yml` | Digests plus a release manifest. |
+| 6 Container Apps environment | `infra/main.bicep` | |
+| 7 Migrations | `.github/workflows/deploy-apps.yml` | Runs to completion before services roll. |
+| 8 Backend services | `infra/apps.bicep` | Same env blocks as part 8. |
+| 9.1 Control surface | `infra/apps.bicep` | |
+| 9.2–9.3 Redirect URI and sign-in | — | Needs the FQDN the deployment produces. Stays manual. |
+| 10 Smoke tests | partly, `scripts/azure/smoke.sh` | Shape checks only; see below. |
+| 11.2 Rollout | `.github/workflows/deploy-apps.yml` | |
+
+### Two things the automation deliberately does not do
+
+**It does not create identity objects.** The Entra app registration, its app
+roles, the user assignments, the federated credential, and Container Apps
+built-in authentication are provisioned by parts 1.3, 1.6, and 9.2–9.3. The
+migration plan's rule is the reason: provision directory objects with a
+documented idempotent bootstrap and feed their IDs in as parameters, rather than
+hiding manually created identity objects behind undocumented template
+parameters.
+
+**It does not run the behavioural smoke tests.** `scripts/azure/smoke.sh`
+asserts the shape of the deployment — every app provisioned and healthy, the
+dispatcher never scaled to zero, exactly one public app, migrations succeeded,
+anonymous access refused. Admitting a plan and executing a run requires reaching
+the private control API, which means opening an ingress window; part 10 does
+that interactively and closes it immediately. A scheduled workflow that opened a
+hole in the network to test itself would be a worse trade than running part 10
+by hand after a release.
+
+### Resource names differ between the two paths
+
+The CLI commands in part 1.2 derive globally unique names from your subscription
+ID. The templates derive them from `uniqueString(resourceGroup().id)`, because a
+template cannot read your shell. Both are deterministic and both are stable, but
+they do not produce the same names.
+
+Pick one path per stamp. To point the templates at a stamp you built by hand,
+pass the existing names instead:
+
+```bash
+export REGISTRY_NAME="$ACR" KEY_VAULT_NAME="$KV" POSTGRES_SERVER_NAME="$PG"
+az deployment group create -g "$RG" -f infra/main.bicep \
+  -p infra/environments/poc.bicepparam
+```
+
+The parameter file reads those three from the environment, so the deployment
+still has exactly one parameter source.
+
+Container app, job, and identity names are already identical in both paths.
+
+---
+
 ## Appendix A — Resource inventory
 
 Everything created in the resource group, after a complete run:

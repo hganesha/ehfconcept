@@ -1,0 +1,133 @@
+# Build both images in ACR and resolve them to digests.
+#
+# Builds run remotely with `az acr build`, so the runner needs no Docker and the
+# registry needs no admin credential. The digests, not the tags, are what every
+# later stage consumes: a tag can be moved, a digest cannot.
+name: build-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'GitHub environment whose registry receives the images'
+        type: environment
+        required: true
+        default: poc
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+    outputs:
+      services-image:
+        description: 'Digest-pinned image for the Node services'
+        value: ${{ jobs.build.outputs.services-image }}
+      ui-image:
+        description: 'Digest-pinned image for the control surface'
+        value: ${{ jobs.build.outputs.ui-image }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: build and pin
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      services-image: ${{ steps.pin.outputs.services-image }}
+      ui-image: ${{ steps.pin.outputs.ui-image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: resolve registry
+        id: registry
+        run: |
+          set -euo pipefail
+          login_server="$(az acr show -n "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
+            --query loginServer -o tsv)"
+          echo "login-server=${login_server}" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # One image serves every Node workload; the control surface is a separate
+      # standalone Next.js build.
+      - name: build services image
+        run: |
+          az acr build --registry "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
+            --platform linux/amd64 \
+            --image "ehf/services:${{ steps.registry.outputs.tag }}" \
+            --file Dockerfile .
+
+      - name: build control surface image
+        run: |
+          az acr build --registry "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
+            --platform linux/amd64 \
+            --image "ehf/control-ui:${{ steps.registry.outputs.tag }}" \
+            --file Dockerfile.ui .
+
+      - name: pin digests
+        id: pin
+        run: |
+          set -euo pipefail
+          services_digest="$(az acr repository show \
+            -n "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
+            --image "ehf/services:${{ steps.registry.outputs.tag }}" \
+            --query digest -o tsv)"
+          ui_digest="$(az acr repository show \
+            -n "${{ vars.AZURE_CONTAINER_REGISTRY }}" \
+            --image "ehf/control-ui:${{ steps.registry.outputs.tag }}" \
+            --query digest -o tsv)"
+
+          services_image="${{ steps.registry.outputs.login-server }}/ehf/services@${services_digest}"
+          ui_image="${{ steps.registry.outputs.login-server }}/ehf/control-ui@${ui_digest}"
+
+          echo "services-image=${services_image}" >> "$GITHUB_OUTPUT"
+          echo "ui-image=${ui_image}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## Images'
+            echo
+            echo "| Image | Digest |"
+            echo "| --- | --- |"
+            echo "| ehf/services | \`${services_digest}\` |"
+            echo "| ehf/control-ui | \`${ui_digest}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The promotion unit from the migration plan, section 10. Promote this
+      # file between environments; rebuilding produces a different artifact and
+      # is not promotion.
+      - name: write release manifest
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg sourceRevision "${{ github.sha }}" \
+            --arg services "${{ steps.pin.outputs.services-image }}" \
+            --arg ui "${{ steps.pin.outputs.ui-image }}" \
+            --arg runId "${{ github.run_id }}" \
+            '{
+               sourceRevision: $sourceRevision,
+               buildRunId: $runId,
+               serviceImages: {
+                 "control-api": $services,
+                 "case-api": $services,
+                 "capability-gateway": $services,
+                 "runtime-host": $services,
+                 "runtime-dispatcher": $services,
+                 "control-ui": $ui
+               },
+               runtimeProvider: "local_http",
+               foundryAgent: null
+             }' > release-manifest.json
+          cat release-manifest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
